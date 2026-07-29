@@ -5,7 +5,7 @@
 [![CI](https://github.com/TheMorpheus407/RepoLens/actions/workflows/ci.yml/badge.svg)](https://github.com/TheMorpheus407/RepoLens/actions/workflows/ci.yml)
 [![GitHub Stars](https://img.shields.io/github/stars/TheMorpheus407/RepoLens?style=social)](https://github.com/TheMorpheus407/RepoLens)
 
-**Multi-lens code audit tool.** Runs 337 specialist lenses across 34 domains against any git repository, live server, Android APK, or product specification and creates remote issues for real findings, backlog work, or polishing shortlists. The polish pass also writes ranked suggestion artifacts for review. Think automated code review, agent-driven pentesting, tool-driven static/dynamic analysis, infrastructure auditing, Android auditing, spec-to-backlog planning, and polishing — all with deep specialization.
+**Multi-lens code audit tool.** Runs 338 specialist lenses across 34 domains against any git repository, live server, Android APK, or product specification and creates remote issues for real findings, backlog work, or polishing shortlists. The polish pass also writes ranked suggestion artifacts for review. Think automated code review, agent-driven pentesting, tool-driven static/dynamic analysis, infrastructure auditing, Android auditing, spec-to-backlog planning, and polishing — all with deep specialization.
 
 > [!IMPORTANT]
 > **RepoLens runs AI agents with shell access against your repository, and a full audit can cost hundreds of dollars in API charges.** It is NOT a sandboxed security tool, comes with NO warranty, and you use it entirely at your own risk. **Read [Warnings & Limits](#warnings--limits) before your first run** — especially the cost and security sections.
@@ -155,7 +155,7 @@ RepoLens is a power tool. Before you point it at anything you care about — or 
 ### Cost — RepoLens can be very expensive
 
 > [!CAUTION]
-> A default full audit runs **248 audit-visible lenses across 27 code/toolgate/logs domains**. RepoLens has 337 lenses across 34 domains in total for issue and backlog modes, but `discover`, `deploy`, `opensource`, `content`, `greenfield`, and `spec-change` lenses are mode-specific and do not run in the default audit mode. The separate polish pass has its own 16 suggestion lenses and also does not run in the default audit mode. Each audit lens loops until the agent emits `DONE` three times in a row. That adds up to **hundreds — often thousands — of agent invocations per run**, and cost scales with your model choice (Claude Opus is dramatically more expensive than smaller models or Codex). Real-world runs can easily reach hundreds of dollars on a single repo.
+> A default full audit runs **248 audit-visible lenses across 27 code/toolgate/logs domains**. RepoLens has 338 lenses across 34 domains in total for issue and backlog modes, but `discover`, `deploy`, `opensource`, `content`, `greenfield`, and `spec-change` lenses are mode-specific and do not run in the default audit mode. The separate polish pass has its own 16 suggestion lenses and also does not run in the default audit mode. Each audit lens loops until the agent emits `DONE` three times in a row. That adds up to **hundreds — often thousands — of agent invocations per run**, and cost scales with your model choice (Claude Opus is dramatically more expensive than smaller models or Codex). Real-world runs can easily reach hundreds of dollars on a single repo.
 
 **Before launching a full audit:**
 
@@ -259,7 +259,7 @@ RepoLens supports 12 modes. Each mode controls which domains/lenses are visible 
 | `deploy`     | 1×          | `deployment` domain (26 lenses) or `android` domain (17 lenses) | Server or Android audit — inspects a live server, APK target, or shallow Gradle Android source tree |
 | `custom`     | 1×          | 27 code/toolgate/logs domains (248 lenses) | Change impact analysis — identifies what needs adapting after a change        |
 | `opensource` | 1×          | `open-source-readiness` domain (13 lenses) | Open-source readiness — checks if a repo can go public safely                 |
-| `content`    | 1×          | `content-quality` domain (17 lenses)       | Content audit & creation — audits or creates content from `--source` material |
+| `content`    | 1×          | `content-quality` domain (18 lenses)       | Content audit & creation — audits or creates content from `--source` material |
 | `greenfield` | 1×          | `greenfield` domain (1 lenses)             | Spec-to-backlog planning — requires `--spec`, checks the current open issue or local draft backlog, and creates non-duplicate `[P0]`-`[P3]` implementation issues without inspecting repository code |
 | `polish`     | 1×          | `fluency`, `effort-signal`, and `hedonic` domains (16 lenses) | Ranked polishing shortlists — proposes small, additive craft refinements with voice-fit evidence |
 | `spec-change` | 1×         | `spec-change` domain (1 lenses)            | Spec-diff impact — requires `--spec` (a tracked spec file), diffs it against `--spec-base` (default `HEAD`), and files one impact-prefixed issue per code change the diff implies |
@@ -309,6 +309,9 @@ RepoLens supports 12 modes. Each mode controls which domains/lenses are visible 
 
 # Content — audit or create educational content
 ./repolens.sh --project ~/my-app --agent claude --mode content --source ~/docs/math-book.pdf
+
+# Content — audit a documentation corpus for OKF v0.2 conformance and readiness
+./repolens.sh --project ~/my-app --agent claude --mode content --focus okf-compliance
 
 # Greenfield — plan implementation backlog from a product spec
 ./repolens.sh --project ~/my-app --agent claude --mode greenfield --spec ~/docs/product-spec.md
@@ -696,7 +699,7 @@ This writes a `.superseded` marker into `logs/<run-id>/` and changes two behavio
 
 The `<run-id>` must be a direct child of `logs/` and a genuine run dir (one carrying `summary.json` or `status.json`). Ids containing `/`, `.`, or `..` are rejected, and superseding a missing or non-run directory exits non-zero with a message.
 
-## Domains & Lenses (337 total across 34 domains)
+## Domains & Lenses (338 total across 34 domains)
 
 ### Code Analysis Domains (used by `audit`, `feature`, `bugfix`, `custom`)
 
@@ -738,7 +741,7 @@ The `<run-id>` must be a direct child of `logs/` and a genuine run dir (one carr
 | **Deployment**            | `deploy`     | 26 lenses | Service health, TLS, DNS, NTP, network security, load balancing, reverse proxy, disk/memory/CPU, containers, database, queues, secrets, SSH, hardening, logs, monitoring, backups, disaster recovery, config drift, dependencies, updates, cron jobs |
 | **Android**               | `deploy`     | 17 lenses | APK overview, package metadata, bundled dependency CVE inventory, native `.so` inventory, JNI surface, binary hardening, AndroidManifest permissions and component flags, exported IPC components, intent filters, deeplinks, App Links, Android intent fuzzing for exported activities, providers, broadcasts, and malformed IPC inputs, drozer attack-surface enumeration for exported activities, services, receivers, providers, backup posture, and shared UID exposure, APK secrets, credentials, internal URLs, WebView security settings, JavaScript bridges, Network Security Config, TLS trust, certificate pinning, MITM traffic observation, logcat sensitive-data leaks, Frida runtime behavior hooks for crypto, file I/O, network, process, reflection, IPC, logging anomalies, anti-tamper and detection-bypass robustness, Android KeyStore, EncryptedSharedPreferences, SQLCipher/Realm secure-storage misuse, Android Lint, detekt, ktlint, Spotless, Gradle SDK consistency, manifest merger, R8/ProGuard posture, suppressions, baselines, and device-aware Android audit context |
 | **Open Source Readiness** | `opensource` | 13 lenses | Secret leaks, license compliance, dependency licensing, internal exposure, git history secrets, community readiness, documentation gaps, monetization exposure, PII, build reproducibility, security posture, code attribution, trademarks           |
-| **Content Quality**       | `content`    | 17 lenses | Content inventory, metadata, staleness, accessibility, linking, duplication, completeness, consistency, code examples, PII, multimedia, versioning, audience targeting, localization, topic extraction, planning, exercise design                    |
+| **Content Quality**       | `content`    | 18 lenses | Content inventory, metadata, OKF v0.2 conformance and readiness, staleness, accessibility, linking, duplication, completeness, consistency, code examples, PII, multimedia, versioning, audience targeting, localization, topic extraction, planning, exercise design                    |
 | **Greenfield Planning**   | `greenfield` | 1 lens | Spec-led backlog planning for new or skeletal projects; creates one implementation-sized `[P0]`-`[P3]` issue per invocation, then continues until existing issues sufficiently cover the spec |
 | **Fluency**               | `polish`     | 6 lenses | Visual-UI processing-fluency refinements for contrast, alignment, spacing, motion, conventions, and typographic rhythm |
 | **Effort Signal**         | `polish`     | 6 lenses | Polishing forgotten corners, empty states, loading transparency, edge cases, errors, and offline or failure states |

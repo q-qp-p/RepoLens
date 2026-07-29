@@ -131,7 +131,7 @@ These domains have a `"mode"` field in `config/domains.json` that restricts them
 | deployment | Deployment | `deploy` | 26 |
 | android | Android | `deploy` | 17 |
 | open-source-readiness | Open Source Readiness | `opensource` | 13 |
-| content-quality | Content Quality | `content` | 17 |
+| content-quality | Content Quality | `content` | 18 |
 | greenfield | Greenfield Planning | `greenfield` | 1 |
 | spec-change | Spec Change Impact | `spec-change` | 1 |
 

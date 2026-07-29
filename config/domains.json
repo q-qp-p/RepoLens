@@ -514,6 +514,7 @@
       "lenses": [
         "content-inventory",
         "metadata-completeness",
+        "okf-compliance",
         "content-staleness",
         "content-accessibility",
         "content-linking",
