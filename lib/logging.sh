@@ -176,8 +176,9 @@ log_raw() {
 _REPOLENS_RESUME_HINT_PRINTED=""
 
 # Print a one-line resume hint to stderr so an aborted/interrupted run tells the
-# user that `--resume <run-id>` exists. Resume is fully wired but undiscoverable;
-# this surfaces it at the moment it is needed.
+# user that `--resume <run-id>` exists. The hint repeats current mode,
+# execution-boundary, output, and non-interactive authorization flags when
+# known. Bundle run artifacts never restore those execution choices.
 #
 # Usage: print_resume_hint [run_id] [project] [agent]
 # Args default to the RUN_ID / PROJECT_PATH / AGENT globals. They are read with
@@ -196,6 +197,21 @@ print_resume_hint() {
   local project="${2:-${PROJECT_PATH:-<path>}}"
   local agent="${3:-${AGENT:-<agent>}}"
   _REPOLENS_RESUME_HINT_PRINTED=1
-  printf 'To resume this run: ./repolens.sh --project %s --agent %s --resume %s\n' \
+  printf 'To resume this run: ./repolens.sh --project %s --agent %s --resume %s' \
     "$project" "$agent" "$run_id" >&2
+  if [[ -n "${MODE:-}" ]]; then
+    printf ' --mode %s' "$MODE" >&2
+  fi
+  if [[ "${LOCAL_MODE:-false}" == "true" ]]; then
+    printf ' --local' >&2
+    if [[ -n "${OUTPUT_DIR:-}" ]]; then
+      printf ' --output %s' "$OUTPUT_DIR" >&2
+    fi
+  elif [[ -n "${FORGE_PROVIDER:-}" && "${FORGE_PROVIDER:-}" != "unknown" ]]; then
+    printf ' --forge %s' "$FORGE_PROVIDER" >&2
+  fi
+  if [[ "${AUTO_YES:-false}" == "true" ]]; then
+    printf ' --yes' >&2
+  fi
+  printf '\n' >&2
 }

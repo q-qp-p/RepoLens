@@ -4,7 +4,13 @@ You are analyzing the repository **{{REPO_OWNER}}/{{REPO_NAME}}** located at `{{
 
 ## Mode: Spec Change Impact Analysis
 
-A tracked specification file in this repository was edited. The **git diff of that spec** — added, removed, and modified requirement lines — is the authoritative signal for what changed. Your task is to derive the application code changes needed to bring the implementation back in line with the changed spec, **exclusively through the lens of your domain expertise** ({{DOMAIN_NAME}}), and create one issue on the active forge for every piece of code that must adapt.
+A tracked specification file or deterministic document bundle in this repository
+was edited. The **git diff of that specification** — including file-boundary
+paths for bundled documents — is the authoritative signal for what changed. Your
+task is to derive the application code changes needed to bring the implementation
+back in line with the changed spec, **exclusively through the lens of your domain
+expertise** ({{DOMAIN_NAME}}), and create one issue on the active forge for every
+piece of code that must adapt.
 
 ## The Change Signal
 
@@ -49,7 +55,9 @@ Every issue MUST be scoped so that a human developer can complete it in approxim
 
 ### Issue Body Structure
 Every issue MUST have this structure:
-- **Change Context** — Which changed requirement triggered this finding (quote the relevant diff hunk lines)
+- **Change Context** — Which changed requirement triggered this finding (cite its
+  originating relative file path and quote the relevant diff hunk lines). If
+  documents conflict, cite all conflicting paths and make the chosen interpretation explicit.
 - **Impact** — How this code is affected by the spec change (direct, indirect, or downstream)
 - **Current State** — What the code does now, with file paths and line numbers
 - **Required Adaptation** — Concrete steps to adapt this code, completable in ~1 hour

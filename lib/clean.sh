@@ -257,10 +257,17 @@ _clean_is_superseded() {
 # resume candidates qualify. The age basis is the dir mtime — co-located with
 # the predicate and matching how `clean_command` sorts runs newest-first.
 _resolve_latest_incomplete_run() {
-  local logs_dir="${SCRIPT_DIR:-.}/logs" dir mtime
+  local logs_dir="${SCRIPT_DIR:-.}/logs" logs_root dir dir_root name mtime
   local best_dir="" best_mtime=-1
-  [[ -d "$logs_dir" ]] || return 1
+  [[ -d "$logs_dir" && ! -L "$logs_dir" ]] || return 1
+  logs_root="$(cd -- "$logs_dir" 2>/dev/null && pwd -P)" || return 1
   for dir in "$logs_dir"/*; do
+    # Resume selection reads status/summary children. Reject a symlinked or
+    # non-canonical parent before any predicate opens those files.
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    name="${dir##*/}"
+    dir_root="$(cd -- "$dir" 2>/dev/null && pwd -P)" || continue
+    [[ "$dir_root" == "$logs_root/$name" ]] || continue
     _clean_is_run_dir "$dir" || continue       # excludes AutoDev dirs / partials
     _clean_is_superseded "$dir" && continue    # retired runs are never auto-picked
     _clean_is_incomplete "$dir" || continue    # resume candidates only

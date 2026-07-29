@@ -335,4 +335,31 @@ assert_eq "genuine run id is used (banner reflects the reused dir)" \
   "20260601T100000Z-genuine000" "$(parse_banner_run_id)"
 assert_eq "exclude-decoys dry-run exits 0" "0" "$RESUME_RC"
 
+# ---------------------------------------------------------------------------
+# Scenario 8 (parent-path trust): a run-id-shaped symlink must be skipped before
+# selector predicates inspect status.json or summary.json beneath it. Otherwise
+# auto-selection can read attacker-chosen files outside logs/ and select an id
+# that only the later explicit-resume gate rejects.
+# ---------------------------------------------------------------------------
+echo ""
+echo "=== Scenario 8: auto-resume skips symlinked run-directory escapes ==="
+
+clean_cleanup
+clean_setup_farm
+make_run "20260601T100000Z-realrun000" "interrupted" "" 5 >/dev/null
+escaped_dir="$CLEAN_TEST_FARM/outside-run"
+mkdir -p "$escaped_dir"
+printf '%s\n' '{"state":"interrupted"}' > "$escaped_dir/status.json"
+printf '%s\n' '{"stopped_reason":"interrupted"}' > "$escaped_dir/summary.json"
+touch -d "@$(epoch_days_ago 0)" "$escaped_dir"
+ln -s "$escaped_dir" "$CLEAN_TEST_LOGS/20260601T170000Z-symlink000"
+
+resume_run --dry-run --resume
+
+assert_contains "auto-resume selects the genuine contained run" \
+  "Auto-resuming latest interrupted run: 20260601T100000Z-realrun000" "$RESUME_OUT"
+assert_not_contains "auto-resume never selects the symlink escape" \
+  "Auto-resuming latest interrupted run: 20260601T170000Z-symlink000" "$RESUME_OUT"
+assert_eq "symlink-parent decoy does not break auto-resume" "0" "$RESUME_RC"
+
 clean_finish

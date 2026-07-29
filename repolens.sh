@@ -40,6 +40,8 @@ source "$SCRIPT_DIR/lib/streak.sh"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/template.sh"
 # shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/spec.sh"
+# shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/summary.sh"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/status.sh"
@@ -196,6 +198,10 @@ Options:
                           false positives, and write a cleaned findings file. Does
                           not run the lens scan. Needs --agent and --project.
   --spec <file>           Spec/PRD/roadmap to guide analysis (required for --mode greenfield / spec-change)
+  --spec-dir <dir>        Directory of spec documents (greenfield/spec-change)
+  --spec-glob <pattern>   Include pattern relative to --spec-dir (repeatable)
+  --spec-entry <file>     Place this included document first
+  --spec-exclude <pattern> Exclude pattern relative to --spec-dir (repeatable)
   --spec-base <ref>       Git base ref/range to diff the --spec file against in
                           --mode spec-change (default: HEAD — working-tree-vs-HEAD,
                           i.e. the uncommitted edit). Accepts a ref (HEAD~1) or a
@@ -565,6 +571,7 @@ AGENT=""
 AGENT_OVERRIDE_CSV=""
 declare -A AGENT_OVERRIDES=()
 MODE="audit"
+MODE_SET=false
 FOCUS=""
 DOMAIN_FILTER=""
 RELEVANT_DOMAINS_CSV=""
@@ -578,8 +585,19 @@ RESUME_RUN_ID=""
 VALIDATE_INPUT=""
 VALIDATE_MODE=false
 SPEC_FILE=""
+SPEC_FILE_SET=false
+SPEC_DIR=""
+SPEC_DIR_SET=false
+SPEC_ENTRY=""
+SPEC_ENTRY_SET=false
+SPEC_ENTRY_PRESENT_CURRENT=false
+declare -a SPEC_GLOBS=()
+SPEC_GLOBS_SET=false
+declare -a SPEC_EXCLUDES=()
+SPEC_EXCLUDES_SET=false
 SPEC_BASE="HEAD"
 SPEC_BASE_SET=false
+SPEC_TRUSTED_MANIFEST_SHA256=""
 MAX_ISSUES=""
 MIN_SEVERITY=""
 DEPTH=""
@@ -613,6 +631,7 @@ MAX_COST=""
 EXPENSIVE_ACK=false
 DRY_RUN=false
 LOCAL_MODE=false
+LOCAL_MODE_SET=false
 # Flat-rate / subscription costing (issue #384): marginal per-token cost is $0
 # for Claude Pro / ChatGPT Plus / Gemini Advanced / free-tier users, so the
 # estimator shows expected request/quota consumption instead of a dollar figure.
@@ -627,6 +646,7 @@ BUILD_ANDROID_APK=false
 OUTPUT_DIR=""
 OUTPUT_DIR_SET=false
 FORGE_PROVIDER=""
+FORGE_PROVIDER_SET=false
 FORGE_HOST=""
 FORGE_REPO_SLUG=""
 FORGE_PROJECT_PATH=""
@@ -653,6 +673,7 @@ while [[ $# -gt 0 ]]; do
     --mode)
       [[ $# -ge 2 ]] || die "Option --mode requires an argument."
       MODE="$2"
+      MODE_SET=true
       shift 2
       ;;
     --focus|--lens)
@@ -712,6 +733,41 @@ while [[ $# -gt 0 ]]; do
     --spec)
       [[ $# -ge 2 ]] || die "Option --spec requires a file path argument."
       SPEC_FILE="$2"
+      SPEC_FILE_SET=true
+      shift 2
+      ;;
+    --spec-dir)
+      [[ $# -ge 2 ]] || die "Option --spec-dir requires a directory path argument."
+      SPEC_DIR="$2"
+      SPEC_DIR_SET=true
+      shift 2
+      ;;
+    --spec-glob)
+      [[ $# -ge 2 ]] || die "Option --spec-glob requires a pattern argument."
+      SPEC_GLOBS_SET=true
+      _spec_pattern_csv="$2"
+      while [[ "$_spec_pattern_csv" == *,* ]]; do
+        SPEC_GLOBS+=("${_spec_pattern_csv%%,*}")
+        _spec_pattern_csv="${_spec_pattern_csv#*,}"
+      done
+      SPEC_GLOBS+=("$_spec_pattern_csv")
+      shift 2
+      ;;
+    --spec-entry)
+      [[ $# -ge 2 ]] || die "Option --spec-entry requires a file argument."
+      SPEC_ENTRY="$2"
+      SPEC_ENTRY_SET=true
+      shift 2
+      ;;
+    --spec-exclude)
+      [[ $# -ge 2 ]] || die "Option --spec-exclude requires a pattern argument."
+      SPEC_EXCLUDES_SET=true
+      _spec_pattern_csv="$2"
+      while [[ "$_spec_pattern_csv" == *,* ]]; do
+        SPEC_EXCLUDES+=("${_spec_pattern_csv%%,*}")
+        _spec_pattern_csv="${_spec_pattern_csv#*,}"
+      done
+      SPEC_EXCLUDES+=("$_spec_pattern_csv")
       shift 2
       ;;
     --spec-base)
@@ -835,6 +891,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --local)
       LOCAL_MODE=true
+      LOCAL_MODE_SET=true
       shift
       ;;
     --deploy-target)
@@ -857,6 +914,7 @@ while [[ $# -gt 0 ]]; do
     --forge)
       [[ $# -ge 2 ]] || die "Option --forge requires an argument (gh|tea|fj)."
       FORGE_PROVIDER="$2"
+      FORGE_PROVIDER_SET=true
       shift 2
       ;;
     --dry-run)
@@ -906,6 +964,182 @@ done
 if [[ "$VALIDATE_MODE" == "true" ]]; then
   run_validate_command
   exit "$?"
+fi
+
+# Resolve a local output path exactly as the normal local-mode setup does. This
+# The same canonicalization is applied to an explicit resume --output; saved
+# run artifacts never supply or authorize that path.
+_canonicalize_local_output_dir() {
+  local requested="$1"
+  [[ -n "$requested" ]] || return 1
+  mkdir -p -- "$requested" || return 1
+  (cd -- "$requested" && pwd -P)
+}
+
+# --- Rehydrate immutable bundle selection before mode-dependent validation ---
+# Run artifacts are data, not authorization. They may restore the frozen
+# specification selection, but the current invocation must explicitly provide
+# the mode and execution boundary (--local, optionally --output; or --forge).
+# --yes is likewise honored only when it appears on this invocation.
+if [[ -n "$RESUME_RUN_ID" ]]; then
+  if [[ "$RESUME_RUN_ID" == "@latest" ]]; then
+    RESUME_RUN_ID="$(_resolve_latest_incomplete_run)" \
+      || die "No interrupted run found to resume; pass an explicit run id or start a fresh run."
+    log_info "Auto-resuming latest interrupted run: $RESUME_RUN_ID"
+  fi
+  if [[ "$RESUME_RUN_ID" == *"/"* || "$RESUME_RUN_ID" == "." || "$RESUME_RUN_ID" == ".." ]]; then
+    die "Invalid run id '$(status_sanitize_display "$RESUME_RUN_ID")'. Run ids must be direct logs/ children."
+  fi
+  RUN_ID="$RESUME_RUN_ID"
+
+  # Establish a real, direct-child run directory before opening any artifact
+  # below it. A symlink at logs/<run-id> would otherwise make non-symlink leaf
+  # checks meaningless and could redirect trusted reads/writes outside logs/.
+  _resume_logs_root="$SCRIPT_DIR/logs"
+  [[ -d "$_resume_logs_root" && ! -L "$_resume_logs_root" ]] \
+    || die "RepoLens logs root is missing or is a symlink: $_resume_logs_root"
+  _resume_logs_root_canonical="$(cd -- "$_resume_logs_root" && pwd -P)" \
+    || die "Unable to resolve RepoLens logs root: $_resume_logs_root"
+  _resume_requested_log_base="$_resume_logs_root/$RUN_ID"
+  [[ -d "$_resume_requested_log_base" && ! -L "$_resume_requested_log_base" ]] \
+    || die "Resume run directory is missing or is a symlink: $_resume_requested_log_base"
+  _resume_log_base="$(cd -- "$_resume_requested_log_base" && pwd -P)" \
+    || die "Unable to resolve resume run directory: $_resume_requested_log_base"
+  case "$_resume_log_base" in
+    "$_resume_logs_root_canonical/$RUN_ID") ;;
+    *)
+      die "Resume run directory escapes the canonical logs root: $_resume_requested_log_base"
+      ;;
+  esac
+  RESUME_LOG_BASE_CANONICAL="$_resume_log_base"
+
+  _resume_metadata="$_resume_log_base/resume-metadata.json"
+  _resume_manifest="$_resume_log_base/spec-files.json"
+  _resume_summary="$_resume_log_base/summary.json"
+  _resume_bundle_identity=false
+  _resume_manifest_schema=""
+
+  if [[ -L "$_resume_metadata" ]]; then
+    die "Persisted bundle resume metadata must not be a symlink: $_resume_metadata"
+  fi
+  if [[ -L "$_resume_manifest" ]]; then
+    die "Persisted specification manifest must not be a symlink: $_resume_manifest"
+  fi
+  if [[ -L "$_resume_summary" ]]; then
+    die "Persisted run summary must not be a symlink: $_resume_summary"
+  fi
+
+  if [[ -f "$_resume_metadata" ]]; then
+    require_cmd jq
+    [[ -f "$_resume_manifest" ]] \
+      || die "Bundle resume metadata exists without its specification manifest: $_resume_manifest"
+    _resume_manifest_schema="$(jq -r '.schema_version // empty' "$_resume_manifest" 2>/dev/null)" \
+      || die "Persisted specification manifest is invalid: $_resume_manifest"
+    if [[ "$_resume_manifest_schema" == "3" ]]; then
+      spec_manifest_verify_resume_identity "$_resume_manifest" "$_resume_metadata" \
+        || die "$SPEC_BUNDLE_ERROR"
+      spec_manifest_validate_resume_shape \
+        "$_resume_manifest" "$_resume_summary" "$_resume_manifest" \
+        || die "$SPEC_BUNDLE_ERROR"
+      spec_sha256_file "$_resume_manifest" || die "$SPEC_BUNDLE_ERROR"
+      SPEC_TRUSTED_MANIFEST_SHA256="$SPEC_SHA256_VALUE"
+    else
+      spec_load_resume_metadata "$_resume_metadata" || die "$SPEC_BUNDLE_ERROR"
+      log_warn "Legacy bundle run $RUN_ID restores specification selection only; pass --mode and an explicit --local/--forge boundary (plus --yes if desired)."
+    fi
+    _resume_bundle_identity=true
+  elif [[ -f "$_resume_manifest" ]]; then
+    # Compatibility for bundle runs created before resume-metadata.json was
+    # introduced. The manifest already contains the exact selection; completed
+    # non-dry runs also carry their mode in summary.json.
+    require_cmd jq
+    _resume_manifest_schema="$(jq -r '.schema_version // empty' "$_resume_manifest" 2>/dev/null)" \
+      || die "Persisted specification manifest is invalid: $_resume_manifest"
+    if [[ "$_resume_manifest_schema" == "3" ]]; then
+      die "Schema-3 specification manifest is missing its integrity-bound resume-metadata.json; cannot resume safely. Start a new run."
+    fi
+    jq -e '
+      .kind == "directory"
+      and (.root | type == "string" and length > 0)
+      and (.entry == null or (.entry | type == "string"))
+      and (.includes | type == "array" and all(.[]; type == "string"))
+      and (.excludes | type == "array" and all(.[]; type == "string"))
+    ' "$_resume_manifest" >/dev/null 2>&1 \
+      || die "Persisted specification manifest is invalid: $_resume_manifest"
+    IFS= read -r -d '' SPEC_RESUME_ROOT \
+      < <(jq -j '.root, "\u0000"' "$_resume_manifest") \
+      || die "Unable to read persisted specification root from $_resume_manifest"
+    IFS= read -r -d '' SPEC_RESUME_ENTRY \
+      < <(jq -j '(.entry // ""), "\u0000"' "$_resume_manifest") \
+      || die "Unable to read persisted specification entry from $_resume_manifest"
+    SPEC_RESUME_GLOBS=()
+    while IFS= read -r -d '' _resume_value; do
+      SPEC_RESUME_GLOBS+=("$_resume_value")
+    done < <(jq -j '.includes[] | ., "\u0000"' "$_resume_manifest")
+    SPEC_RESUME_EXCLUDES=()
+    while IFS= read -r -d '' _resume_value; do
+      SPEC_RESUME_EXCLUDES+=("$_resume_value")
+    done < <(jq -j '.excludes[] | ., "\u0000"' "$_resume_manifest")
+    SPEC_RESUME_BASE="HEAD"
+    SPEC_RESUME_MODE=""
+    if [[ -f "$_resume_summary" ]]; then
+      IFS= read -r -d '' SPEC_RESUME_MODE \
+        < <(jq -j '(.mode // ""), "\u0000"' "$_resume_summary") \
+        || die "Unable to read persisted run mode from $_resume_summary"
+    fi
+    _resume_bundle_identity=true
+  fi
+
+  if $_resume_bundle_identity; then
+    if $LOCAL_MODE_SET && $FORGE_PROVIDER_SET; then
+      die "Bundle resume execution boundary is ambiguous: choose --local (optionally --output) or --forge <gh|tea|fj>, not both"
+    elif $LOCAL_MODE_SET; then
+      LOCAL_MODE=true
+    elif $FORGE_PROVIDER_SET; then
+      $OUTPUT_DIR_SET \
+        && die "Bundle resume --output requires the explicit --local boundary"
+      LOCAL_MODE=false
+    else
+      die "Bundle resume requires an explicit execution boundary: pass --local (optionally --output <path>) or --forge <gh|tea|fj>"
+    fi
+
+    if [[ -n "$SPEC_RESUME_MODE" ]]; then
+      case "$SPEC_RESUME_MODE" in
+        greenfield|spec-change) ;;
+        *) die "Persisted bundle run $RUN_ID has invalid mode '$SPEC_RESUME_MODE'" ;;
+      esac
+      $MODE_SET \
+        || die "Bundle resume requires explicit current mode intent: pass --mode $SPEC_RESUME_MODE"
+      if $MODE_SET && [[ "$MODE" != "$SPEC_RESUME_MODE" ]]; then
+        die "Resume of run $RUN_ID was originally executed with --mode $SPEC_RESUME_MODE, cannot resume with --mode $MODE"
+      fi
+    elif ! $MODE_SET; then
+      die "Resume of legacy bundle run $RUN_ID cannot infer its original mode; pass --mode greenfield or --mode spec-change explicitly"
+    fi
+
+    $SPEC_FILE_SET \
+      && die "Resume of bundle run $RUN_ID uses --spec-dir; --spec would change the run identity"
+    if ! $SPEC_DIR_SET; then
+      SPEC_DIR="$SPEC_RESUME_ROOT"
+    fi
+    if ! $SPEC_ENTRY_SET; then
+      SPEC_ENTRY="$SPEC_RESUME_ENTRY"
+    fi
+    if ! $SPEC_GLOBS_SET; then
+      SPEC_GLOBS=("${SPEC_RESUME_GLOBS[@]}")
+    fi
+    if ! $SPEC_EXCLUDES_SET; then
+      SPEC_EXCLUDES=("${SPEC_RESUME_EXCLUDES[@]}")
+    fi
+    if $SPEC_BASE_SET && [[ "$SPEC_BASE" != "$SPEC_RESUME_BASE" ]]; then
+      die "Resume --spec-base '$SPEC_BASE' does not match persisted value '$SPEC_RESUME_BASE'"
+    fi
+    SPEC_BASE="$SPEC_RESUME_BASE"
+  fi
+
+  unset _resume_log_base _resume_metadata _resume_manifest _resume_summary
+  unset _resume_bundle_identity _resume_manifest_schema _resume_value
+  unset _resume_logs_root _resume_logs_root_canonical _resume_requested_log_base
 fi
 
 # --- Validate --output requires --local ---
@@ -1157,6 +1391,21 @@ fi
 if $SPEC_BASE_SET && [[ "$MODE" != "spec-change" ]]; then
   die "--spec-base requires --mode spec-change"
 fi
+if [[ -n "$SPEC_FILE" && -n "$SPEC_DIR" ]]; then
+  die "--spec and --spec-dir are mutually exclusive"
+fi
+if [[ -z "$SPEC_DIR" && ${#SPEC_GLOBS[@]} -gt 0 ]]; then
+  die "--spec-glob requires --spec-dir"
+fi
+if [[ -z "$SPEC_DIR" && -n "$SPEC_ENTRY" ]]; then
+  die "--spec-entry requires --spec-dir"
+fi
+if [[ -z "$SPEC_DIR" && ${#SPEC_EXCLUDES[@]} -gt 0 ]]; then
+  die "--spec-exclude requires --spec-dir"
+fi
+if [[ -n "$SPEC_DIR" && "$MODE" != "greenfield" && "$MODE" != "spec-change" ]]; then
+  die "--spec-dir is only valid with --mode greenfield or --mode spec-change"
+fi
 if [[ -n "$REMOTE_TARGET" && "$MODE" != "deploy" ]]; then
   die "--remote requires --mode deploy"
 fi
@@ -1381,17 +1630,18 @@ if [[ "$MODE" == "bugreport" && -z "$BUG_REPORT" && -z "$RESUME_RUN_ID" ]]; then
 fi
 
 # --- Validate greenfield spec requirement ---
-if [[ "$MODE" == "greenfield" && -z "$SPEC_FILE" ]]; then
-  die "Mode 'greenfield' requires --spec <file>"
+if [[ "$MODE" == "greenfield" && -z "$SPEC_FILE" && -z "$SPEC_DIR" ]]; then
+  die "Mode 'greenfield' requires --spec <file> or --spec-dir <dir>"
 fi
 
 # --- Validate spec-change spec requirement ---
-if [[ "$MODE" == "spec-change" && -z "$SPEC_FILE" ]]; then
-  die "Mode 'spec-change' requires --spec <file>"
+if [[ "$MODE" == "spec-change" && -z "$SPEC_FILE" && -z "$SPEC_DIR" ]]; then
+  die "Mode 'spec-change' requires --spec <file> or --spec-dir <dir>"
 fi
 
 # --- Handle remote repository URL ---
 CLONE_DIR=""
+SPEC_RESUME_SNAPSHOT_DIR=""
 
 _cleanup_clone() {
   if [[ -n "${CLONE_DIR:-}" && -d "$CLONE_DIR" ]]; then
@@ -1409,6 +1659,15 @@ _cleanup_remote_control_socket() {
   fi
 }
 
+_cleanup_spec_resume_snapshot() {
+  [[ -n "${SPEC_RESUME_SNAPSHOT_DIR:-}" ]] || return 0
+  case "$SPEC_RESUME_SNAPSHOT_DIR" in
+    "$SCRIPT_DIR"/logs/*/.resume-snapshot.*)
+      rm -rf -- "$SPEC_RESUME_SNAPSHOT_DIR"
+      ;;
+  esac
+}
+
 _cleanup_all() {
   stop_status_updater "${REPOLENS_FINAL_STATE:-finished}" 2>/dev/null || true
   if $HOSTED 2>/dev/null; then
@@ -1419,6 +1678,7 @@ _cleanup_all() {
   else
     _cleanup_remote_control_socket 2>/dev/null || true
   fi
+  _cleanup_spec_resume_snapshot
   _cleanup_clone
 }
 trap _cleanup_all EXIT
@@ -1857,6 +2117,63 @@ if [[ -n "$SPEC_FILE" ]]; then
   fi
   unset _spec_size
 fi
+if [[ -n "$SPEC_DIR" ]]; then
+  if [[ -n "$RESUME_RUN_ID" ]] && ! $SPEC_DIR_SET; then
+    # A bundle resume consumes the frozen combined artifact and manifest; its
+    # original source directory may have moved or been deleted in the meantime.
+    # The persisted root is already canonical and is compared verbatim below.
+    [[ "$SPEC_DIR" == /* ]] \
+      || die "Persisted specification root is not absolute: $SPEC_DIR"
+  else
+    [[ ! -L "$SPEC_DIR" ]] \
+      || die "Spec directory must not be a symlink: $SPEC_DIR"
+    [[ -d "$SPEC_DIR" ]] || die "Spec directory not found: $SPEC_DIR"
+    [[ -r "$SPEC_DIR" ]] || die "Spec directory not readable: $SPEC_DIR"
+    SPEC_DIR="$(cd "$SPEC_DIR" && pwd)"
+  fi
+  [[ ${#SPEC_GLOBS[@]} -gt 0 ]] || SPEC_GLOBS=("**/*.md")
+
+  declare -a _normalized_spec_patterns=()
+  for _spec_pattern in "${SPEC_GLOBS[@]}"; do
+    spec_normalize_pattern "$_spec_pattern" "--spec-glob" \
+      || die "$SPEC_BUNDLE_ERROR"
+    _normalized_spec_patterns+=("$SPEC_NORMALIZED_VALUE")
+  done
+  SPEC_GLOBS=("${_normalized_spec_patterns[@]}")
+  _normalized_spec_patterns=()
+  for _spec_pattern in "${SPEC_EXCLUDES[@]}"; do
+    spec_normalize_pattern "$_spec_pattern" "--spec-exclude" \
+      || die "$SPEC_BUNDLE_ERROR"
+    _normalized_spec_patterns+=("$SPEC_NORMALIZED_VALUE")
+  done
+  SPEC_EXCLUDES=("${_normalized_spec_patterns[@]}")
+  unset _normalized_spec_patterns _spec_pattern
+
+  if [[ -n "$SPEC_ENTRY" ]]; then
+    spec_normalize_entry "$SPEC_ENTRY" || die "$SPEC_BUNDLE_ERROR"
+    SPEC_ENTRY="$SPEC_NORMALIZED_VALUE"
+  fi
+
+  # A resumed bundle is rehydrated from its immutable run artifacts below.
+  # Fresh runs resolve and validate the worktree before allocating a run id.
+  if [[ -z "$RESUME_RUN_ID" ]]; then
+    spec_resolve_worktree "$SPEC_DIR" "$SPEC_ENTRY" || die "$SPEC_BUNDLE_ERROR"
+    [[ ${#SPEC_BUNDLE_FILES[@]} -gt 0 ]] \
+      || die "No spec files matched in $SPEC_DIR using pattern(s): ${SPEC_GLOBS[*]}"
+    if [[ -n "$SPEC_ENTRY" ]]; then
+      for _spec_rel in "${SPEC_BUNDLE_FILES[@]}"; do
+        if [[ "$_spec_rel" == "$SPEC_ENTRY" ]]; then
+          SPEC_ENTRY_PRESENT_CURRENT=true
+          break
+        fi
+      done
+      if [[ "$MODE" != "spec-change" ]] && ! $SPEC_ENTRY_PRESENT_CURRENT; then
+        die "--spec-entry '$SPEC_ENTRY' is not included by the effective spec patterns"
+      fi
+    fi
+    spec_validate_worktree_sources "$SPEC_DIR" || die "$SPEC_BUNDLE_ERROR"
+  fi
+fi
 
 # --- Validate --hosted prerequisites ---
 if $HOSTED; then
@@ -2019,26 +2336,13 @@ if ! $LOCAL_MODE; then
   forge_auth_status
 fi
 
-# --- Generate or resume run ID ---
-if [[ -n "$RESUME_RUN_ID" ]]; then
-  # `--resume` with no explicit id resolves to the newest interrupted run.
-  # Resolve here — before LOG_BASE/acquire_run_lock/mkdir below — so a
-  # no-candidate die leaks no fresh run dir.
-  if [[ "$RESUME_RUN_ID" == "@latest" ]]; then
-    RESUME_RUN_ID="$(_resolve_latest_incomplete_run)" \
-      || die "No interrupted run found to resume; pass an explicit run id or start a fresh run."
-    log_info "Auto-resuming latest interrupted run: $RESUME_RUN_ID"
-  fi
-  if [[ "$RESUME_RUN_ID" == *"/"* || "$RESUME_RUN_ID" == "." || "$RESUME_RUN_ID" == ".." ]]; then
-    die "Invalid run id '$(status_sanitize_display "$RESUME_RUN_ID")'. Run ids must be direct logs/ children."
-  fi
-  RUN_ID="$RESUME_RUN_ID"
-else
+# --- Generate a fresh run ID (resume IDs were resolved before validation) ---
+if [[ -z "$RESUME_RUN_ID" ]]; then
   RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')"
 fi
 
 # --- Directories ---
-LOG_BASE="$SCRIPT_DIR/logs/$RUN_ID"
+LOG_BASE="${RESUME_LOG_BASE_CANONICAL:-$SCRIPT_DIR/logs/$RUN_ID}"
 export LOG_BASE
 acquire_run_lock
 HEARTBEAT_DIR="$LOG_BASE/.heartbeat"
@@ -2089,6 +2393,62 @@ if [[ "$MODE" == "bugreport" ]]; then
   [[ -n "$BUG_REPORT" ]] || die "Mode 'bugreport' could not resolve a bug report (and resume could not recover one from $BUG_REPORT_FILE)"
 fi
 
+# --- Resolve and persist a multi-file specification bundle ---
+SPEC_MANIFEST_FILE=""
+SPEC_MANIFEST_READ_FILE=""
+SPEC_BUNDLE_COUNT=0
+SPEC_BUNDLE_BYTES=0
+if [[ -n "$SPEC_DIR" ]]; then
+  SPEC_MANIFEST_FILE="$LOG_BASE/spec-files.json"
+  SPEC_MANIFEST_READ_FILE="$SPEC_MANIFEST_FILE"
+  _combined_spec_source="$LOG_BASE/combined-spec.md"
+  _combined_spec="$_combined_spec_source"
+  if [[ -n "$RESUME_RUN_ID" ]]; then
+    [[ -f "$SPEC_MANIFEST_FILE" && ! -L "$SPEC_MANIFEST_FILE" \
+      && -f "$_combined_spec_source" && ! -L "$_combined_spec_source" ]] \
+      || die "Resume of bundle run $RUN_ID requires persisted spec-files.json and combined-spec.md artifacts"
+    SPEC_RESUME_SNAPSHOT_DIR="$(mktemp -d "$LOG_BASE/.resume-snapshot.XXXXXX")" \
+      || die "Unable to allocate a private bundle resume snapshot"
+    chmod 700 "$SPEC_RESUME_SNAPSHOT_DIR" \
+      || die "Unable to protect the private bundle resume snapshot"
+    spec_snapshot_regular_file \
+      "$SPEC_MANIFEST_FILE" "$SPEC_RESUME_SNAPSHOT_DIR/spec-files.json" \
+      "specification manifest" || die "$SPEC_BUNDLE_ERROR"
+    SPEC_MANIFEST_READ_FILE="$SPEC_RESUME_SNAPSHOT_DIR/spec-files.json"
+    if [[ -n "$SPEC_TRUSTED_MANIFEST_SHA256" ]]; then
+      spec_sha256_file "$SPEC_MANIFEST_READ_FILE" || die "$SPEC_BUNDLE_ERROR"
+      [[ "$SPEC_SHA256_VALUE" == "$SPEC_TRUSTED_MANIFEST_SHA256" ]] \
+        || die "Persisted specification manifest changed after resume routing was authenticated; cannot resume safely. Start a new run."
+    fi
+    spec_manifest_matches_options "$SPEC_MANIFEST_READ_FILE" "$SPEC_DIR" "$SPEC_ENTRY" \
+      || die "$SPEC_BUNDLE_ERROR"
+    _combined_spec="$SPEC_RESUME_SNAPSHOT_DIR/combined-spec.md"
+    spec_manifest_snapshot_artifact \
+      "$SPEC_MANIFEST_READ_FILE" "combined_spec" "$_combined_spec_source" \
+      "combined-spec.md" "$_combined_spec" "combined specification bundle" \
+      || die "$SPEC_BUNDLE_ERROR"
+    spec_load_manifest_files "$SPEC_MANIFEST_READ_FILE" || die "$SPEC_BUNDLE_ERROR"
+    [[ ${#SPEC_BUNDLE_FILES[@]} -gt 0 ]] \
+      || die "Persisted specification manifest contains no files: $SPEC_MANIFEST_READ_FILE"
+    spec_validate_combined_file "$_combined_spec" "Persisted combined spec bundle" \
+      || die "$SPEC_BUNDLE_ERROR"
+  else
+    spec_compose_worktree "$SPEC_DIR" "$_combined_spec" \
+      || die "${SPEC_BUNDLE_ERROR:-Unable to compose specification bundle from $SPEC_DIR}"
+    spec_validate_combined_file "$_combined_spec" "Combined spec bundle" \
+      || die "$SPEC_BUNDLE_ERROR"
+    spec_write_manifest "$SPEC_MANIFEST_FILE" "$SPEC_DIR" "$SPEC_ENTRY" "$_combined_spec" \
+      || die "${SPEC_BUNDLE_ERROR:-Unable to persist specification manifest to $SPEC_MANIFEST_FILE}"
+  fi
+
+  # Preserve the worktree resolution: resolving the Git base below produces a
+  # separate set that may include documents deleted from the working tree.
+  _spec_current_files=("${SPEC_BUNDLE_FILES[@]}")
+  SPEC_BUNDLE_COUNT="${#SPEC_BUNDLE_FILES[@]}"
+  SPEC_BUNDLE_BYTES="$(wc -c < "$_combined_spec")"
+  SPEC_FILE="$_combined_spec"
+fi
+
 # --- Compute / rehydrate the spec diff for spec-change mode ---
 # spec-change derives its work from the git diff of the tracked --spec file
 # against --spec-base (default HEAD = working-tree-vs-HEAD, i.e. the uncommitted
@@ -2099,10 +2459,86 @@ fi
 # inside the repo so a diff baseline exists (mirrors the greenfield/custom
 # fail-fast guards). An empty diff is valid — it renders a "no changes" notice
 # and the wrapper terminates early without filing issues.
-SPEC_DIFF_FILE="$LOG_BASE/spec-diff.txt"
+SPEC_DIFF_PERSISTED_FILE="$LOG_BASE/spec-diff.txt"
+SPEC_DIFF_FILE="$SPEC_DIFF_PERSISTED_FILE"
 if [[ "$MODE" == "spec-change" ]]; then
-  if [[ -n "$RESUME_RUN_ID" && -f "$SPEC_DIFF_FILE" ]]; then
+  if [[ -n "$RESUME_RUN_ID" ]]; then
+    [[ -f "$SPEC_DIFF_PERSISTED_FILE" && ! -L "$SPEC_DIFF_PERSISTED_FILE" ]] \
+      || die "Resume of spec-change run $RUN_ID requires a regular non-symlink persisted spec-diff.txt artifact"
+    if [[ -n "$SPEC_DIR" ]]; then
+      _base_combined_source="$LOG_BASE/combined-spec.base.md"
+      [[ -f "$_base_combined_source" && ! -L "$_base_combined_source" ]] \
+        || die "Resume of bundle spec-change run $RUN_ID requires a regular non-symlink combined-spec.base.md"
+      spec_manifest_snapshot_artifact \
+        "$SPEC_MANIFEST_READ_FILE" "base_combined_spec" \
+        "$_base_combined_source" "combined-spec.base.md" \
+        "$SPEC_RESUME_SNAPSHOT_DIR/combined-spec.base.md" \
+        "base combined specification bundle" \
+        || die "$SPEC_BUNDLE_ERROR"
+      SPEC_DIFF_FILE="$SPEC_RESUME_SNAPSHOT_DIR/spec-diff.txt"
+      spec_manifest_snapshot_artifact \
+        "$SPEC_MANIFEST_READ_FILE" "spec_diff" "$SPEC_DIFF_PERSISTED_FILE" \
+        "spec-diff.txt" "$SPEC_DIFF_FILE" "combined specification diff" \
+        || die "$SPEC_BUNDLE_ERROR"
+    fi
     : # Reuse the diff captured at the original run start for reproducibility.
+  elif [[ -n "$SPEC_DIR" ]]; then
+    if [[ "$SPEC_DIR" == "$PROJECT_PATH" ]]; then
+      _spec_root_rel=""
+    else
+      case "$SPEC_DIR/" in
+        "$PROJECT_PATH"/*) _spec_root_rel="${SPEC_DIR#"$PROJECT_PATH"/}" ;;
+        *) die "Mode 'spec-change' requires --spec-dir to be inside $PROJECT_PATH" ;;
+      esac
+    fi
+
+    for _spec_rel in "${_spec_current_files[@]}"; do
+      _spec_tracked_path="${_spec_root_rel:+$_spec_root_rel/}$_spec_rel"
+      git -C "$PROJECT_PATH" ls-files --error-unmatch -- ":(literal)$_spec_tracked_path" >/dev/null 2>&1 \
+        || die "Mode 'spec-change' requires every selected spec file to be tracked by git: $SPEC_DIR/$_spec_rel"
+    done
+
+    git -C "$PROJECT_PATH" rev-parse --verify "${SPEC_BASE}^{tree}" >/dev/null 2>&1 \
+      || die "Mode 'spec-change' requires --spec-base to resolve to a single Git tree: '$SPEC_BASE'"
+    spec_resolve_git_tree "$PROJECT_PATH" "$_spec_root_rel" "$SPEC_BASE" "$SPEC_ENTRY" \
+      || die "$SPEC_BUNDLE_ERROR"
+    _spec_base_files=("${SPEC_BUNDLE_FILES[@]}")
+    if [[ -n "$SPEC_ENTRY" ]] && ! $SPEC_ENTRY_PRESENT_CURRENT; then
+      _spec_entry_present_base=false
+      for _spec_rel in "${_spec_base_files[@]}"; do
+        if [[ "$_spec_rel" == "$SPEC_ENTRY" ]]; then
+          _spec_entry_present_base=true
+          break
+        fi
+      done
+      $_spec_entry_present_base \
+        || die "--spec-entry '$SPEC_ENTRY' is not included by the effective base/current specification union"
+    fi
+    _spec_base_combined="$LOG_BASE/combined-spec.base.md"
+    spec_compose_git_tree "$PROJECT_PATH" "$_spec_root_rel" "$SPEC_BASE" "$_spec_base_combined" \
+      || die "${SPEC_BUNDLE_ERROR:-Unable to compose base specification bundle from '$SPEC_BASE'.}"
+    spec_validate_combined_file "$_spec_base_combined" "Base combined spec bundle" \
+      || die "$SPEC_BUNDLE_ERROR"
+    SPEC_BUNDLE_FILES=("${_spec_current_files[@]}")
+    if (
+      cd "$LOG_BASE" \
+        && git diff --no-index --no-ext-diff -- combined-spec.base.md combined-spec.md
+    ) > "$SPEC_DIFF_FILE"; then
+      _spec_diff_rc=0
+    else
+      _spec_diff_rc=$?
+    fi
+    [[ "$_spec_diff_rc" -le 1 ]] \
+      || die "Mode 'spec-change' could not compute the combined spec diff against base ref '$SPEC_BASE'."
+    spec_manifest_record_artifact \
+      "$SPEC_MANIFEST_FILE" "base_combined_spec" \
+      "$_spec_base_combined" "combined-spec.base.md" \
+      || die "$SPEC_BUNDLE_ERROR"
+    spec_manifest_record_artifact \
+      "$SPEC_MANIFEST_FILE" "spec_diff" "$SPEC_DIFF_FILE" "spec-diff.txt" \
+      || die "$SPEC_BUNDLE_ERROR"
+    unset _spec_root_rel _spec_base_combined _spec_diff_rc _spec_tracked_path
+    unset _spec_base_files _spec_entry_present_base
   else
     git -C "$PROJECT_PATH" ls-files --error-unmatch -- "$SPEC_FILE" >/dev/null 2>&1 \
       || die "Mode 'spec-change' requires --spec to be a file tracked by git inside $PROJECT_PATH (so a diff baseline exists): $SPEC_FILE"
@@ -2156,8 +2592,20 @@ if $LOCAL_MODE; then
       die "Unable to resolve round lens output directory"
     fi
   fi
-  mkdir -p "$OUTPUT_DIR"
-  OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+  OUTPUT_DIR="$(_canonicalize_local_output_dir "$OUTPUT_DIR")" \
+    || die "Unable to resolve local output directory: $OUTPUT_DIR"
+fi
+
+# Persist only the immutable bundle selection. Execution routing and --yes are
+# intentionally current-invocation choices and never enter these artifacts.
+# This runs after all spec-change artifacts have been recorded.
+if [[ -n "$SPEC_DIR" && -z "$RESUME_RUN_ID" ]]; then
+  spec_write_resume_metadata \
+    "$LOG_BASE/resume-metadata.json" "$MODE" "$SPEC_DIR" "$SPEC_ENTRY" "$SPEC_BASE" \
+    || die "${SPEC_BUNDLE_ERROR:-Unable to persist bundle resume metadata}"
+  spec_manifest_record_resume_identity \
+    "$SPEC_MANIFEST_FILE" "$LOG_BASE/resume-metadata.json" \
+    || die "${SPEC_BUNDLE_ERROR:-Unable to bind bundle resume identity to its integrity manifest}"
 fi
 
 # --- Validate config files exist ---
@@ -2286,6 +2734,12 @@ log_info "Agent timeout: ${AGENT_TIMEOUT_SECS}s"
 log_info "Agent timeout kill grace: ${AGENT_KILL_GRACE_SECS}s"
 log_info "Lens wall-clock budget: ${LENS_MAX_WALL_SECS}s"
 [[ -n "$SPEC_FILE" ]] && log_info "Spec: $SPEC_FILE"
+if [[ -n "$SPEC_DIR" ]]; then
+  log_info "Spec bundle: $SPEC_BUNDLE_COUNT files, $SPEC_BUNDLE_BYTES bytes (manifest: $SPEC_MANIFEST_FILE)"
+  for _spec_rel in "${SPEC_BUNDLE_FILES[@]}"; do
+    log_info "  $_spec_rel"
+  done
+fi
 [[ -n "$MAX_ISSUES" ]] && log_info "Max issues: $MAX_ISSUES (DONE streak: 1)"
 if [[ -n "$MIN_SEVERITY_MODE_EXEMPT" ]]; then
   log_warn "--min-severity has no effect in ${MIN_SEVERITY_MODE_EXEMPT} mode (this mode does not use severity)"
@@ -3345,6 +3799,19 @@ if $DRY_RUN; then
   echo "Agent:        $AGENT"
   print_agent_override_map
   echo "Project:      $PROJECT_PATH"
+  if [[ -n "$SPEC_DIR" ]]; then
+    echo "Spec root:    $SPEC_DIR"
+    echo "Spec files:   $SPEC_BUNDLE_COUNT"
+    echo "Combined size: $SPEC_BUNDLE_BYTES bytes"
+    echo "Spec manifest: $SPEC_MANIFEST_FILE"
+    for _spec_rel in "${SPEC_BUNDLE_FILES[@]}"; do
+      if [[ "$_spec_rel" == "$SPEC_ENTRY" ]]; then
+        echo "  $_spec_rel (entry)"
+      else
+        echo "  $_spec_rel"
+      fi
+    done
+  fi
   echo "Rounds:      $ROUNDS"
   if [[ "$MODE" == "bugreport" ]]; then
     echo "Strategy:     $STRATEGY"
@@ -3476,7 +3943,11 @@ ensure_labels() {
 
   if [[ -n "$SPEC_FILE" ]]; then
     local spec_basename
-    spec_basename="$(basename "$SPEC_FILE" | sed 's/\.[^.]*$//')"
+    if [[ -n "$SPEC_DIR" ]]; then
+      spec_basename="$(basename "$SPEC_DIR")"
+    else
+      spec_basename="$(basename "$SPEC_FILE" | sed 's/\.[^.]*$//')"
+    fi
     local spec_label="spec:${spec_basename}"
     printf '%s=%s\n' "$spec_label" "c9b1ff" >> "$label_set_file"
   fi
@@ -3502,6 +3973,23 @@ if [[ ! -f "$SUMMARY_FILE" ]] || [[ -z "$RESUME_RUN_ID" ]]; then
     init_summary "$SUMMARY_FILE" "$RUN_ID" "$PROJECT_PATH" "$MODE" "$AGENT" "$SPEC_FILE" "$MAX_ISSUES" "local" "$OUTPUT_DIR" "${REMOTE_TARGET:-}" "${REMOTE_LABEL:-}"
   else
     init_summary "$SUMMARY_FILE" "$RUN_ID" "$PROJECT_PATH" "$MODE" "$AGENT" "$SPEC_FILE" "$MAX_ISSUES" "github" "" "${REMOTE_TARGET:-}" "${REMOTE_LABEL:-}"
+  fi
+  if [[ -n "$SPEC_MANIFEST_FILE" ]]; then
+    _summary_tmp="$(mktemp "${SUMMARY_FILE}.tmp.XXXXXX")" \
+      || die "Unable to allocate temporary summary metadata"
+    if ! jq --arg manifest "$SPEC_MANIFEST_FILE" \
+      --arg root "$SPEC_DIR" \
+      --argjson count "$SPEC_BUNDLE_COUNT" \
+      --argjson bytes "$SPEC_BUNDLE_BYTES" \
+      --argjson integrity "$(jq -c '.artifact_integrity' "$SPEC_MANIFEST_READ_FILE")" \
+      '.spec = null | .spec_set = {kind:"directory", root:$root, manifest:$manifest,
+        file_count:$count, combined_bytes:$bytes, artifact_integrity:$integrity}' \
+      "$SUMMARY_FILE" > "$_summary_tmp"; then
+      rm -f "$_summary_tmp"
+      die "Unable to add specification bundle metadata to $SUMMARY_FILE"
+    fi
+    mv "$_summary_tmp" "$SUMMARY_FILE" \
+      || die "Unable to persist specification bundle metadata to $SUMMARY_FILE"
   fi
 fi
 

@@ -10,6 +10,10 @@ Your task is to turn the supplied product specification into the next implementa
 
 - Treat the embedded specification as the authoritative product-owner intent source.
 - Treat the embedded specification as the complete source of human product intent.
+- File-boundary paths in a bundled specification are provenance metadata. Document
+  order, including an entry document appearing first, does not establish precedence.
+- If documents conflict, cite every conflicting relative path, state the
+  interpretation chosen and why in `## Planner Decisions`, and never hide the conflict.
 - Use the embedded current backlog snapshot to understand backlog coverage and avoid duplicates.
 - Do not inspect repository code, dependencies, configuration, tests, docs, or current implementation details.
 - Do not run code-search or file-reading commands against `{{PROJECT_PATH}}`.
@@ -50,7 +54,9 @@ Your task is to turn the supplied product specification into the next implementa
 Every issue MUST use these exact Markdown headings in this order:
 
 - `## Summary` - Summarize the implementation outcome AutoDev should deliver and why it matters for the spec-backed slice.
-- `## Spec Reference` - Cite the relevant spec section, quoted requirement, or brief requirement summary.
+- `## Spec Reference` - Cite the originating relative file path for a bundled
+  specification. Then cite the relevant heading, quoted requirement, or brief
+  requirement summary for either input form.
 - `## Planner Decisions` - Record the concrete product, UX, validation, error, accessibility, responsive behavior, security, sequencing, and architecture decisions the planner made for this slice.
 - `## User-Visible Behavior` - Describe the normal behavior and any empty, loading, error, validation, disabled, success, or state-transition behavior users or operators will observe.
 - `## Accessibility And Responsive Behavior` - State accessibility and responsive behavior expectations when relevant, or write `Not applicable` with a short reason for non-UI/backend-only work.
