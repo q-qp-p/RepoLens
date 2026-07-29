@@ -1,6 +1,6 @@
 {
-  "_comment": "USD per 1M tokens. Update when model pricing changes. 'agent_default_model' maps --agent values to a model id in 'models'. <agent>/<model> (claude/codex/opencode/antigravity) parses the <model> segment and looks it up in 'models'; an unknown model buckets by keyword into generic-flash/pro/premium-default (opencode/<model> keeps its opencode-default fallback).",
-  "updated_at": "2026-07-09",
+  "_comment": "USD per 1M tokens. Update when model pricing changes. 'agent_default_model' maps --agent values to a model id in 'models'. <agent>/<model> for claude/codex/antigravity parses the <model> segment and looks it up in 'models'; an unknown model buckets by keyword into generic-flash/pro/premium-default (opencode/<model> keeps its opencode-default fallback). Cursor and cursor/<model>, as well as cursor-ide, always use the authenticated Cursor subscription marker instead of API-token pricing.",
+  "updated_at": "2026-07-29",
   "models": {
     "claude-sonnet-4-5": {
       "label": "Claude Sonnet 4.5",
@@ -61,6 +61,11 @@
       "label": "generic premium class (keyword-matched)",
       "input_per_mtok": 15.00,
       "output_per_mtok": 75.00
+    },
+    "cursor-auto": {
+      "label": "Cursor subscription (Auto or pinned plan model)",
+      "input_per_mtok": 0.00,
+      "output_per_mtok": 0.00
     }
   },
   "agent_default_model": {
@@ -68,6 +73,8 @@
     "codex": "gpt-5",
     "spark": "spark",
     "sparc": "spark",
+    "cursor": "cursor-auto",
+    "cursor-ide": "cursor-auto",
     "opencode": "opencode-default",
     "antigravity": "gemini-2.5-pro"
   },

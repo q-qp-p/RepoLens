@@ -32,6 +32,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/core.sh"
 # shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/cursor_ide.sh"
+# shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/logging.sh"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/lib/remote.sh"
@@ -143,7 +145,7 @@ any git repository and creates remote issues for real findings.
 
 Required:
   --project <path|url>    Local path or remote Git URL (cloned read-only if URL)
-  --agent <agent>         claude | codex | spark | sparc | opencode | opencode/<model> | antigravity
+  --agent <agent>         claude | codex | spark | sparc | cursor | cursor/<model> | cursor-ide | opencode | opencode/<model> | antigravity
 
 Commands:
   status [run-id]         Show a live run snapshot from logs/<run-id>/status.json
@@ -249,7 +251,8 @@ Options:
   --flat-rate             Flat-rate / subscription costing (or REPOLENS_FLAT_RATE=true):
                           show $0.00 marginal cost and expected request/quota
                           consumption instead of a per-token dollar estimate
-                          (Claude Pro / ChatGPT Plus / Gemini Advanced / free tiers)
+                          (Claude Pro / ChatGPT Plus / Gemini Advanced / free tiers);
+                          Cursor variants use their subscription view automatically
   --i-know-this-is-expensive
                           Acknowledge high --rounds cost. Bypasses the
                           rounds>=4 abort gate (which otherwise demands
@@ -292,6 +295,8 @@ Examples:
   repolens.sh --project ~/myapp --agent claude --hosted --domain toolgate
   repolens.sh --project ~/myapp --agent claude --hosted --focus dast-web
   repolens.sh --project ~/myapp --agent claude --local
+  repolens.sh --project ~/myapp --agent cursor --flat-rate --local --domain security
+  repolens.sh --project ~/myapp --agent cursor-ide --local --focus injection
   repolens.sh --project ~/myapp --agent claude --local --output ~/reports/myapp-audit
   repolens.sh --project ~/myapp --agent claude --local --domain security --parallel
 
@@ -316,6 +321,23 @@ Environment:
                            Antigravity per-invocation timeout override; wins over
                            REPOLENS_AGENT_TIMEOUT and the mode-specific timeouts
                            when --agent antigravity is selected.
+  REPOLENS_AGENT_TIMEOUT_CURSOR
+                           Cursor per-invocation timeout override; also used for
+                           cursor/<model> and cursor-ide handoff waits.
+  REPOLENS_CURSOR_IDE_MAX_WAIT_SEC
+                           Maximum seconds to wait for each Composer handoff.
+                           Defaults to the resolved agent timeout.
+  REPOLENS_CURSOR_IDE_POLL_SEC
+                           Completion-marker polling interval (default: 1).
+  REPOLENS_CURSOR_IDE_MIN_RESPONSE_BYTES
+                           Minimum non-whitespace bytes accepted from Composer
+                           (default: 120).
+  REPOLENS_CURSOR_IDE_MIN_PATH_LINE_ANCHORS
+                           Minimum verified project path:line citations required
+                           from each lens handoff (default: 1).
+  REPOLENS_CURSOR_IDE_HANDOFF_DIR
+                           Optional parent directory for request-scoped Cursor
+                           IDE handoff artifacts. Defaults under the run logs.
   REPOLENS_AGENT_TIMEOUT_AUDIT
                            Audit default: 1800.
   REPOLENS_AGENT_TIMEOUT_FEATURE
@@ -962,6 +984,12 @@ done
 # here (like clean/status/supersede) before any run-pipeline setup so the heavy
 # machinery never engages.
 if [[ "$VALIDATE_MODE" == "true" ]]; then
+  if [[ "$AGENT" == "cursor-ide" ]]; then
+    [[ "$LOCAL_MODE" == "true" ]] \
+      || die "--agent cursor-ide requires --local; use --agent cursor for unattended Cursor CLI runs"
+    exec {REPOLENS_CURSOR_IDE_CONTROL_FD}>&2
+    export REPOLENS_CURSOR_IDE_CONTROL_FD
+  fi
   run_validate_command
   exit "$?"
 fi
@@ -1145,6 +1173,17 @@ fi
 # --- Validate --output requires --local ---
 if [[ -n "$OUTPUT_DIR" ]] && ! $LOCAL_MODE; then
   die "--output requires --local (use --local to write findings as local markdown files)"
+fi
+
+# Cursor Composer has no supported unattended IDE API. The cursor-ide backend
+# is therefore an explicit local filesystem handoff, not a remote issue-filing
+# agent. `cursor` and `cursor/<model>` remain the headless CLI backends.
+if [[ "$AGENT" == "cursor-ide" && "$LOCAL_MODE" != "true" ]]; then
+  die "--agent cursor-ide requires --local; use --agent cursor for unattended Cursor CLI runs"
+fi
+if [[ "$AGENT" == "cursor-ide" && "$PARALLEL" == "true" ]]; then
+  warn "--agent cursor-ide uses one ordered Composer handoff queue; forcing sequential execution"
+  PARALLEL=false
 fi
 
 # --- Handle --change flag ---
@@ -2681,6 +2720,9 @@ validate_agent_overrides() {
     # global --agent uses. validate_agent names the offending value on failure.
     validate_agent "$_val"
     require_agent_cmd "$_val"
+    if [[ "$_val" == "cursor-ide" && "$LOCAL_MODE" != "true" ]]; then
+      die "--agent-override $_key=cursor-ide requires --local"
+    fi
 
     # Validate the key. A '/' means a fully-qualified lens key.
     if [[ "$_key" == */* ]]; then
@@ -2699,6 +2741,33 @@ validate_agent_overrides() {
 }
 
 validate_agent_overrides
+
+CURSOR_IDE_ACTIVE=false
+if [[ "$AGENT" == "cursor-ide" ]]; then
+  CURSOR_IDE_ACTIVE=true
+else
+  for _cursor_ide_override_agent in "${AGENT_OVERRIDES[@]}"; do
+    if [[ "$_cursor_ide_override_agent" == "cursor-ide" ]]; then
+      CURSOR_IDE_ACTIVE=true
+      break
+    fi
+  done
+  unset _cursor_ide_override_agent
+fi
+
+if $CURSOR_IDE_ACTIVE; then
+  if $PARALLEL; then
+    warn "cursor-ide overrides use one ordered Composer handoff queue; forcing sequential execution"
+    PARALLEL=false
+  fi
+  if [[ -z "${REPOLENS_CURSOR_IDE_CONTROL_FD:-}" ]]; then
+    exec {REPOLENS_CURSOR_IDE_CONTROL_FD}>&2
+    export REPOLENS_CURSOR_IDE_CONTROL_FD
+  fi
+  REPOLENS_CURSOR_IDE_CTL_LOG="$LOG_BASE/cursor-ide/events.ndjson"
+  export REPOLENS_CURSOR_IDE_CTL_LOG
+  mkdir -p "$(dirname "$REPOLENS_CURSOR_IDE_CTL_LOG")"
+fi
 # Resolve the base wrapper file once at startup. The pure resolver
 # returns the canonical mapping (deploy/android -> android.md, else
 # <MODE>.md); we then fall back to deploy.md when the canonical file is
@@ -3293,17 +3362,28 @@ run_lens_heartbeat_exit_trap() {
 
 # --- Cost estimation (token-based, model-aware, repo-size-aware) ---
 # Resolve an --agent value to a model id in agent-pricing.json.
-# Handles: claude, codex, spark, sparc, opencode, antigravity, and the
-# <agent>/<model> forms claude/, codex/, opencode/, antigravity/ (issue #384).
+# Handles: claude, codex, spark, sparc, cursor, opencode, antigravity, and the
+# <agent>/<model> forms claude/, codex/, cursor/, opencode/, antigravity/.
 # For a slashed agent: an explicit id in models{} is priced directly; otherwise
 # a keyword heuristic buckets the model name into a generic-{flash,pro,premium}
 # class so a brand-new model name is approximated instead of falling back to an
-# arbitrary high default. opencode/<model> keeps its historical opencode-default
-# fallback. Bare agents resolve via agent_default_model.
+# arbitrary high default. Cursor is the exception: both cursor and
+# cursor/<model> authenticate against a Cursor subscription, so every Cursor
+# model resolves to the subscription marker rather than fabricated API-token
+# pricing. opencode/<model> keeps its historical opencode-default fallback. Bare
+# agents resolve via agent_default_model.
 resolve_agent_model() {
   local agent="$1" pricing_file="$2"
   local default_model model_check requested req_lower
+  if [[ "$agent" == "cursor-ide" ]]; then
+    echo "cursor-auto"
+    return
+  fi
   if [[ "$agent" == */* ]]; then
+    if [[ "$agent" == cursor/* ]]; then
+      echo "cursor-auto"
+      return
+    fi
     requested="${agent#*/}"
     # Explicit id wins over the keyword heuristic, so a known model is priced
     # exactly rather than mis-bucketed by an unlucky substring in its name.
@@ -3342,6 +3422,45 @@ resolve_agent_model() {
   else
     echo "opencode-default"
   fi
+}
+
+# Cursor's CLI authenticates against the user's Cursor plan for both Auto and a
+# pinned cursor/<model>. It therefore has request/quota consumption, not a
+# RepoLens-computable pay-as-you-go token bill.
+agent_uses_subscription_costing() {
+  case "$1" in
+    cursor|cursor/*|cursor-ide) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# True only when every lens in the resolved run routes to Cursor. Explicit
+# --flat-rate remains a separate, provider-agnostic operator choice; this helper
+# supplies Cursor's automatic subscription default without misclassifying a
+# mixed routed run.
+all_effective_lens_agents_use_subscription_costing() {
+  local _entry _dom _lid _eff _seen=false
+  for _entry in "${LENS_LIST[@]}"; do
+    _seen=true
+    _dom="${_entry%%/*}"
+    _lid="${_entry#*/}"
+    _eff="$(resolve_effective_agent "$_dom" "$_lid")"
+    agent_uses_subscription_costing "$_eff" || return 1
+  done
+  $_seen
+}
+
+# Used only to label a mixed routed estimate accurately. Cursor groups render a
+# quota/request block; the monetary total covers the remaining groups.
+lens_agents_include_subscription_costing() {
+  local _entry _dom _lid _eff
+  for _entry in "${LENS_LIST[@]}"; do
+    _dom="${_entry%%/*}"
+    _lid="${_entry#*/}"
+    _eff="$(resolve_effective_agent "$_dom" "$_lid")"
+    agent_uses_subscription_costing "$_eff" && return 0
+  done
+  return 1
 }
 
 # Sum bytes of likely-source files in a project path, excluding common vendor dirs.
@@ -3452,6 +3571,11 @@ compute_cost_breakdown_routed() {
   local _total="0.00" _lines="" _a _cnt _sub _sub_min _sub_lines
   for _a in "${!_agent_counts[@]}"; do
     _cnt="${_agent_counts[$_a]}"
+    if agent_uses_subscription_costing "$_a"; then
+      _sub="$(print_subscription_usage "$pricing_file" "$_cnt" cursor "$_a" "$streak" "$rounds" "$path")"
+      _lines+="$_sub"$'\n'
+      continue
+    fi
     _sub="$(compute_cost_breakdown "$_a" "$_cnt" "$streak" "$path" "$pricing_file" "$rounds")"
     _sub_min="$(printf '%s\n' "$_sub" | awk -F= '/^MIN_COST=/ {print $2; exit}')"
     _sub_lines="$(printf '%s\n' "$_sub" | grep -v '^MIN_COST=')"
@@ -3463,14 +3587,13 @@ compute_cost_breakdown_routed() {
   printf '%s' "$_lines"
 }
 
-# Flat-rate / subscription cost view (issue #384). For Claude Pro / ChatGPT Plus
-# / Gemini Advanced / free-tier users the marginal per-token cost is $0.00, so a
-# dollar estimate is misleading. This renders "$0.00" plus the expected request
-# count (the same lenses x avg_iters x rounds the token estimate uses) and the
-# quota/rate-limit consumption to weigh against a subscription cap or free-tier
-# budget. Reads TOTAL_LENSES, DONE_STREAK_REQUIRED, ROUNDS, PROJECT_PATH.
-print_flat_rate_cost() {
-  local pricing_file="$1"
+# Shared subscription/quota renderer. `kind=generic` preserves the explicit
+# --flat-rate contract from issue #384; `kind=cursor` reports Cursor-plan usage
+# automatically for cursor and cursor/<model>. An agent label is supplied for a
+# Cursor group nested inside a mixed --agent-override estimate.
+print_subscription_usage() {
+  local pricing_file="$1" lenses="$2" kind="${3:-generic}" agent_label="${4:-}"
+  local streak="${5:-$DONE_STREAK_REQUIRED}" rounds="${6:-$ROUNDS}" project_path="${7:-$PROJECT_PATH}"
   local iter_factor base_prompt input_cap out_per bytes_per_tok
   iter_factor="$(jq -r '.session_model.iteration_factor // 1.7' "$pricing_file" 2>/dev/null)"
   base_prompt="$(jq -r '.session_model.base_prompt_tokens // 3000' "$pricing_file" 2>/dev/null)"
@@ -3485,12 +3608,13 @@ print_flat_rate_cost() {
   [[ "$bytes_per_tok" =~ ^[1-9][0-9]*$ ]] || bytes_per_tok=4
 
   local repo_bytes
-  repo_bytes="$(estimate_repo_bytes "$PROJECT_PATH")"
+  repo_bytes="$(estimate_repo_bytes "$project_path")"
 
-  awk -v lenses="$TOTAL_LENSES" -v streak="$DONE_STREAK_REQUIRED" -v rounds="$ROUNDS" \
+  awk -v lenses="$lenses" -v streak="$streak" -v rounds="$rounds" \
       -v iter_factor="$iter_factor" -v base_prompt="$base_prompt" \
       -v input_cap="$input_cap" -v out_per="$out_per" \
       -v repo_bytes="$repo_bytes" -v bytes_per_tok="$bytes_per_tok" \
+      -v kind="$kind" -v agent_label="$agent_label" \
       'BEGIN {
         if (rounds < 1) rounds = 1
         avg_iters = streak * iter_factor
@@ -3499,18 +3623,47 @@ print_flat_rate_cost() {
         repo_tokens = int(repo_bytes / bytes_per_tok)
         session_input = (repo_tokens < input_cap ? repo_tokens : input_cap) + base_prompt
 
-        printf "Estimated cost: ~$0.00 (Flat-Rate / Subscription / Free Tier)\n"
-        printf "  Total expected requests: ~%.0f LLM calls  (%d lenses x ~%.1f iterations x %d round(s))\n", requests, lenses, avg_iters, rounds
-        printf "  - Consumes your plan message/rate quota, not a per-token bill. Weigh ~%.0f calls against:\n", requests
-        printf "      a typical 3-hour subscription cap (e.g. Claude Pro / Gemini Advanced, ~45-50 messages), or\n"
-        printf "      a free-tier rate budget (e.g. Google AI Studio 15 RPM / 1500 RPD).\n"
-        printf "  - Pace or split large runs so you do not lock yourself out of your plan mid-audit.\n"
-        if (session_input >= 1000) {
-          printf "  Total expected tokens: ~%.0fk input + ~%d output per session\n", session_input/1000.0, out_per
+        prefix = "  "
+        if (agent_label != "") {
+          printf "  agent \047%s\047 — %d lens(es):\n", agent_label, lenses
+          printf "    Estimated marginal token cost: ~$0.00 (Cursor Subscription)\n"
+          prefix = "    "
+        } else if (kind == "cursor") {
+          printf "Estimated cost: ~$0.00 marginal token cost (Cursor Subscription)\n"
         } else {
-          printf "  Total expected tokens: ~%d input + ~%d output per session\n", session_input, out_per
+          printf "Estimated cost: ~$0.00 (Flat-Rate / Subscription / Free Tier)\n"
+        }
+
+        printf "%sTotal expected requests: ~%.0f LLM calls  (%d lenses x ~%.1f iterations x %d round(s))\n", prefix, requests, lenses, avg_iters, rounds
+        if (kind == "cursor") {
+          printf "%s- Consumes Cursor plan request/model quota rather than incurring a separate token bill.\n", prefix
+          printf "%s- Exact quota impact depends on your Cursor plan and selected model; check Cursor usage before a large run.\n", prefix
+        } else {
+          printf "%s- Consumes your plan message/rate quota, not a per-token bill. Weigh ~%.0f calls against:\n", prefix, requests
+          printf "%s    a typical 3-hour subscription cap (e.g. Claude Pro / Gemini Advanced, ~45-50 messages), or\n", prefix
+          printf "%s    a free-tier rate budget (e.g. Google AI Studio 15 RPM / 1500 RPD).\n", prefix
+        }
+        printf "%s- Pace or split large runs so you do not lock yourself out of your plan mid-audit.\n", prefix
+        if (session_input >= 1000) {
+          printf "%sTotal expected tokens: ~%.0fk input + ~%d output per session\n", prefix, session_input/1000.0, out_per
+        } else {
+          printf "%sTotal expected tokens: ~%d input + ~%d output per session\n", prefix, session_input, out_per
         }
       }'
+}
+
+# Flat-rate / subscription cost view (issue #384). For Claude Pro / ChatGPT Plus
+# / Gemini Advanced / free-tier users the marginal per-token cost is $0.00, so a
+# dollar estimate is misleading. Explicit --flat-rate remains provider-agnostic.
+print_flat_rate_cost() {
+  print_subscription_usage "$1" "$TOTAL_LENSES" generic
+}
+
+# Cursor always authenticates through a subscription. This automatic view is
+# intentionally Cursor-specific so it does not imply generic API token prices
+# or unrelated providers' quota limits.
+print_cursor_subscription_cost() {
+  print_subscription_usage "$1" "$TOTAL_LENSES" cursor
 }
 
 # Print the active --agent-override routing map (one 'key -> agent' per line),
@@ -3646,11 +3799,15 @@ confirm_run() {
 
   local pricing_file="$SCRIPT_DIR/config/agent-pricing.json"
   check_pricing_freshness "$pricing_file"
-  local breakdown min_cost breakdown_lines
+  local breakdown min_cost breakdown_lines cursor_subscription_only=false
+  if ! $FLAT_RATE && all_effective_lens_agents_use_subscription_costing; then
+    cursor_subscription_only=true
+  fi
   # Flat-rate mode ($0 marginal cost) skips the per-token breakdown entirely and
-  # renders the request/quota view instead. min_cost stays "0.00" so the
-  # --max-cost guardrail below is inert (0 never exceeds any threshold).
-  if ! $FLAT_RATE; then
+  # renders the request/quota view instead. Cursor uses the same $0 marginal-cost
+  # guardrail semantics automatically, but gets a Cursor-specific quota view.
+  # min_cost stays "0.00" so --max-cost is inert for an all-subscription run.
+  if ! $FLAT_RATE && ! $cursor_subscription_only; then
     if overrides_active; then
       breakdown="$(compute_cost_breakdown_routed "$DONE_STREAK_REQUIRED" "$PROJECT_PATH" "$pricing_file" "$ROUNDS")"
     else
@@ -3678,10 +3835,16 @@ confirm_run() {
   echo ""
   if $FLAT_RATE; then
     print_flat_rate_cost "$pricing_file"
+  elif $cursor_subscription_only; then
+    print_cursor_subscription_cost "$pricing_file"
   else
-    echo "Estimated cost: ~\$${min_cost}  (lens_count=${TOTAL_LENSES} x depth=${DONE_STREAK_REQUIRED} x rounds=${ROUNDS}, lower bound — real runs typically 2-5x higher)"
+    if lens_agents_include_subscription_costing; then
+      echo "Estimated pay-as-you-go portion: ~\$${min_cost}  (non-Cursor lenses only; lower bound)"
+    else
+      echo "Estimated cost: ~\$${min_cost}  (lens_count=${TOTAL_LENSES} x depth=${DONE_STREAK_REQUIRED} x rounds=${ROUNDS}, lower bound — real runs typically 2-5x higher)"
+    fi
     printf "%s\n" "$breakdown_lines"
-    echo "  Note: Estimator assumes one model per agent, 4 bytes/token, and a"
+    echo "  Note: Token estimator assumes one model per billed agent, 4 bytes/token, and a"
     echo "  capped per-session input budget. Tool-call churn and iteration"
     echo "  non-convergence push real cost higher. Budget accordingly."
   fi
@@ -3833,9 +3996,17 @@ if $DRY_RUN; then
     _dry_pricing_file="$SCRIPT_DIR/config/agent-pricing.json"
     if [[ -f "$_dry_pricing_file" ]]; then
       check_pricing_freshness "$_dry_pricing_file"
+      _dry_cursor_subscription_only=false
+      if ! $FLAT_RATE && all_effective_lens_agents_use_subscription_costing; then
+        _dry_cursor_subscription_only=true
+      fi
       if $FLAT_RATE; then
         # Flat-rate: $0 marginal cost + request/quota consumption (issue #384).
         print_flat_rate_cost "$_dry_pricing_file"
+        unset _dry_pricing_file
+      elif $_dry_cursor_subscription_only; then
+        # Cursor and cursor/<model> always consume the authenticated plan quota.
+        print_cursor_subscription_cost "$_dry_pricing_file"
         unset _dry_pricing_file
       else
         if overrides_active; then
@@ -3845,10 +4016,15 @@ if $DRY_RUN; then
         fi
         _dry_min_cost="$(printf "%s\n" "$_dry_breakdown" | awk -F= '/^MIN_COST=/ {print $2; exit}')"
         _dry_breakdown_lines="$(printf "%s\n" "$_dry_breakdown" | grep -v '^MIN_COST=')"
-        echo "Estimated cost: ~\$${_dry_min_cost}  (lens_count=${TOTAL_LENSES} x depth=${DONE_STREAK_REQUIRED} x rounds=${ROUNDS}, lower bound — real runs typically 2-5x higher)"
+        if lens_agents_include_subscription_costing; then
+          echo "Estimated pay-as-you-go portion: ~\$${_dry_min_cost}  (non-Cursor lenses only; lower bound)"
+        else
+          echo "Estimated cost: ~\$${_dry_min_cost}  (lens_count=${TOTAL_LENSES} x depth=${DONE_STREAK_REQUIRED} x rounds=${ROUNDS}, lower bound — real runs typically 2-5x higher)"
+        fi
         printf "%s\n" "$_dry_breakdown_lines"
         unset _dry_pricing_file _dry_breakdown _dry_min_cost _dry_breakdown_lines
       fi
+      unset _dry_cursor_subscription_only
     fi
     # The wall-clock estimate needs no pricing data, so emit it whenever lenses
     # are queued — even if config/agent-pricing.json is absent and the cost block
@@ -4278,7 +4454,16 @@ run_lens() {
       fi
     fi
 
-    run_agent "$effective_agent" "$prompt" "$PROJECT_PATH" "$effective_timeout_secs" "$AGENT_KILL_GRACE_SECS" "$envelope_file" >"$output_file" 2>&1 || agent_rc=$?
+    if [[ "$effective_agent" == "cursor-ide" ]]; then
+      REPOLENS_CURSOR_IDE_PHASE="lens" \
+      REPOLENS_CURSOR_IDE_DOMAIN="$domain" \
+      REPOLENS_CURSOR_IDE_LENS="$lens_id" \
+      REPOLENS_CURSOR_IDE_ITERATION="$iteration" \
+      REPOLENS_CURSOR_IDE_HANDOFF_DIR="${REPOLENS_CURSOR_IDE_HANDOFF_DIR:-$lens_log_dir/cursor-ide}" \
+        run_agent "$effective_agent" "$prompt" "$PROJECT_PATH" "$effective_timeout_secs" "$AGENT_KILL_GRACE_SECS" "$envelope_file" >"$output_file" 2>&1 || agent_rc=$?
+    else
+      run_agent "$effective_agent" "$prompt" "$PROJECT_PATH" "$effective_timeout_secs" "$AGENT_KILL_GRACE_SECS" "$envelope_file" >"$output_file" 2>&1 || agent_rc=$?
+    fi
     if [[ -s "$envelope_file" && "$output_envelope_file" != "$envelope_file" ]]; then
       mkdir -p "$(dirname "$output_envelope_file")" 2>/dev/null || true
       cp "$envelope_file" "$output_envelope_file" 2>/dev/null || true
@@ -4289,6 +4474,17 @@ run_lens() {
       log_error "[$domain/$lens_id] agent timed out after ${effective_timeout_secs}s and was hard-killed after ${AGENT_KILL_GRACE_SECS}s grace on iteration $iteration"
     elif [[ "$agent_rc" -ne 0 ]]; then
       log_warn "[$domain/$lens_id] Agent returned non-zero on iteration $iteration. Continuing."
+    fi
+
+    # A Cursor IDE handoff timeout means there is no assistant response to
+    # iterate on. Stop immediately, leave the lens out of .completed, and reuse
+    # the existing resumable no-progress sentinel rather than manufacturing two
+    # more empty handoffs.
+    if [[ "$effective_agent" == "cursor-ide" && "$agent_rc" -eq 124 ]]; then
+      log_warn "[$domain/$lens_id] Cursor IDE handoff timed out; stopping this attempt so it can be resumed."
+      : > "$LOG_BASE/.agent-no-progress-abort"
+      exit_status="agent-no-progress"
+      break
     fi
 
     # Detect rate-limit / quota / auth-failure signatures in agent output.
@@ -4876,6 +5072,13 @@ write_latest_result_pointer \
   "$SUMMARY_FILE" \
   "${REPOLENS_FINAL_STATE:-finished}" \
   "$LOG_BASE/final" || true
+
+# Cursor Composer watches the durable control stream, so explicitly terminate
+# the handoff queue after the final state and exit code have been resolved.
+if [[ "${CURSOR_IDE_ACTIVE:-false}" == "true" ]]; then
+  cursor_ide_emit_run_complete \
+    "$RUN_ID" "${REPOLENS_FINAL_STATE:-finished}" "$SUMMARY_FILE"
+fi
 
 log_info "=============================="
 log_info "RepoLens run $RUN_ID complete"

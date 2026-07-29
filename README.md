@@ -36,7 +36,7 @@ Supported forges are GitHub (`gh`), Gitea (`tea`), and Codeberg/Forgejo (`fj`). 
 
 Self-hosted instances whose hostnames do not match the auto-detect heuristics require `--forge <gh|tea|fj>`. Self-hosted Forgejo targets also need an HTTPS or SSH `origin` remote so RepoLens can pass a secure `fj -H <host>` binding; insecure HTTP origins are not used for authenticated `fj` commands.
 
-### Supported Agent CLIs
+### Supported Agent Backends
 
 | `--agent` value       | CLI required | Notes                                   |
 | --------------------- | ------------ | --------------------------------------- |
@@ -45,15 +45,18 @@ Self-hosted instances whose hostnames do not match the auto-detect heuristics re
 | `codex`               | `codex`      | OpenAI Codex CLI                        |
 | `codex/<model>`       | `codex`      | Codex CLI pinned to a specific model    |
 | `spark` / `sparc`     | `codex`      | Codex CLI with spark model              |
+| `cursor`              | `cursor-agent` | Cursor CLI with subscription Auto routing |
+| `cursor/<model>`      | `cursor-agent` | Cursor CLI pinned to a subscription model |
+| `cursor-ide`          | none         | Ordered filesystem handoff to Cursor Composer |
 | `opencode`            | `opencode`   | Open-source agent CLI (75+ providers)   |
 | `opencode/<model>`    | `opencode`   | opencode with a specific provider/model |
 | `antigravity`         | `agy`        | Google Antigravity CLI                  |
 | `antigravity/<model>` | `agy`        | Antigravity pinned to a specific model  |
 
-You need **at least one** agent CLI installed and authenticated before running RepoLens. Install commands and auth flows differ per CLI — see below.
+You need **at least one** agent backend before running RepoLens. CLI backends must be installed and authenticated as described below. `cursor-ide` instead uses an open Cursor IDE/Composer session and requires no agent CLI.
 
 > [!NOTE]
-> Append `/<model>` to `claude`, `codex`, `opencode`, or `antigravity` to pin that run to a specific model — e.g. `--agent claude/claude-haiku-4-5` for a cheap, fast pass, or `--agent codex/<model>` / `--agent antigravity/<model>` to select any model your installed CLI and plan accept (including newly released ones). The model string is passed straight to the CLI. The `spark`/`sparc` presets do **not** take a `/<model>` suffix — use `codex/<model>` to choose a Codex model yourself. These `/<model>` forms are also valid [`--agent-override`](#optional-flags) targets. When RepoLens has no exact pricing for a model, its cost estimate is approximated from keywords in the model name (`flash`/`haiku`/`mini` price as cheap, `opus`/`ultra` as premium, everything else as standard).
+> Append `/<model>` to `claude`, `codex`, `cursor`, `opencode`, or `antigravity` to pin that run to a specific model — e.g. `--agent claude/claude-haiku-4-5` for a cheap, fast pass, or `--agent cursor/<model>` / `--agent antigravity/<model>` to select any model your installed CLI and plan accept (including newly released ones). The model string is passed straight to the CLI. Bare `--agent cursor` uses Cursor's Auto router. The `spark`/`sparc` presets do **not** take a `/<model>` suffix — use `codex/<model>` to choose a Codex model yourself. These `/<model>` forms are also valid [`--agent-override`](#optional-flags) targets. For token-billed agents, an unknown model's cost estimate is approximated from keywords in its name (`flash`/`haiku`/`mini` price as cheap, `opus`/`ultra` as premium, everything else as standard). Cursor variants instead report subscription request/quota usage and are never assigned made-up API token prices.
 
 > [!TIP]
 > **Recommendation:** Use `claude` for complex audits — it produces the highest-quality findings, but is also the most expensive option. For a cheaper alternative, run `opencode` with a MiniMax model — costs are a fraction of Claude, with the trade-off of more false positives. Calibrate on a single lens or domain (`--focus` / `--domain`) before committing to a full parallel run. To get both in one run, keep a cheap default `--agent` and route only the reasoning-heavy domains (e.g. `security`, `architecture`) to `claude` with [`--agent-override`](#optional-flags).
@@ -87,6 +90,36 @@ Alternatives: `brew install --cask codex` (macOS), or prebuilt binaries from [gi
 - Or export `OPENAI_API_KEY` in your shell
 
 The `spark` / `sparc` agent values reuse the same `codex` binary — installing once covers all three.
+
+#### Cursor CLI (`cursor`)
+
+**Install** — Linux, macOS, WSL:
+
+```bash
+curl -fsSL https://cursor.com/install | bash
+```
+
+**Authenticate:** run `cursor-agent login` and complete the browser flow, then verify it with `cursor-agent status`. Cursor CLI uses the models available through your Cursor subscription; no separate model API key is required. RepoLens invokes the backward-compatible `cursor-agent` binary in non-interactive text mode with command approvals enabled. This is the unattended backend; it is distinct from the IDE handoff below.
+
+Bare `--agent cursor` uses Cursor's Auto model routing. To pin any model exposed by your plan, run `cursor-agent models` (or use the CLI's model picker) and pass its identifier as `--agent cursor/<model>`. Both forms automatically show a `$0.00` marginal token cost plus expected request/quota consumption; RepoLens never substitutes generic API prices for a pinned Cursor model. Exact quota impact varies by Cursor plan and selected model, so check Cursor's usage view before a large audit. The provider-agnostic `--flat-rate` flag remains available when you explicitly want its generic subscription/free-tier view.
+
+```bash
+./repolens.sh --project ~/my-app --agent cursor --local --domain security
+```
+
+#### Cursor IDE / Composer (`cursor-ide`)
+
+Use `cursor-ide` when you want the models and tools available in an existing Cursor IDE subscription session without installing or authenticating `cursor-agent`:
+
+```bash
+./repolens.sh --project ~/my-app --agent cursor-ide --local --focus injection
+```
+
+RepoLens remains the iteration and resume state machine. For each invocation it emits a `REPOLENS_CTL` event and writes a request-specific `request.json` plus `prompt.md`. Cursor Composer reads that prompt, writes `response.md`, and atomically publishes `complete.json`. The completion marker contains the random request id and response hash, so a stale marker, a partial response, or output for a different prompt cannot advance the run. Lens replies also need substantive Method/Findings sections and a verified project `path:line` citation; a bare `DONE` is rejected instead of becoming a false green.
+
+Cursor currently exposes no supported API for automatically driving an IDE Composer chat, so this is an explicit handoff rather than UI automation. It requires `--local` and runs sequentially; `--parallel` is downgraded with a warning. Completed lenses stay in the normal `.completed` state, an interrupted or timed-out handoff remains resumable with `--resume`, and all request/response artifacts plus the event stream remain under `logs/<run-id>/`.
+
+See [Cursor IDE handoff](docs/cursor-ide.md) for the Composer workflow, exact atomic completion command, timeout controls, and recovery instructions.
 
 #### opencode (`opencode`)
 
@@ -160,14 +193,14 @@ RepoLens is a power tool. Before you point it at anything you care about — or 
 **Before launching a full audit:**
 
 - Use `--max-cost <dollars>` to set a budget — RepoLens warns if the minimum estimate exceeds it. The estimate is a **lower bound**; real runs typically cost 2–5× more due to tool-call churn and DONE-streak iteration.
-- On a **flat-rate subscription or free tier** (Claude Pro, ChatGPT Plus, Gemini Advanced, Google AI Studio free tier, …), pass `--flat-rate` (or set `REPOLENS_FLAT_RATE=true`). The marginal per-token cost of a run is `$0.00`, so instead of a misleading dollar figure the estimate shows the expected number of LLM calls and how much of a typical message cap or free-tier rate budget the run will consume — letting you pace or split a large audit rather than lock yourself out of your plan mid-run.
+- On a **flat-rate subscription or free tier** (Claude Pro, ChatGPT Plus, Gemini Advanced, Google AI Studio free tier, …), pass `--flat-rate` (or set `REPOLENS_FLAT_RATE=true`). The marginal per-token cost of a run is `$0.00`, so instead of a misleading dollar figure the estimate shows the expected number of LLM calls and how much of a typical message cap or free-tier rate budget the run will consume — letting you pace or split a large audit rather than lock yourself out of your plan mid-run. Cursor's CLI is always subscription-authenticated, so `cursor` and `cursor/<model>` select this quota-oriented behavior automatically.
 - Use `--dry-run` to preview which lenses would execute without spending anything.
 - Check the **estimated wall-clock** line printed at the confirmation prompt and in `--dry-run` (e.g. `~4h 30m at --max-parallel 8`) to know how long a run will take before you launch it. When the estimate exceeds 24h, RepoLens prints a loud warning listing levers to cut it down; tune the threshold with `REPOLENS_EST_WARN_HOURS` (`0` disables it).
 - Use `--max-issues <n>` to cap output (also forces sequential execution).
 - Scope with `--focus <lens-id>` or `--domain <domain-id>` instead of auditing everything at once.
 - Calibrate cost on a single domain with a cheap agent (`codex`, `opencode`) before committing to a full parallel audit with a premium model.
 
-You are responsible for every dollar of API spend. Know your per-token pricing.
+You are responsible for every dollar of API spend and every subscription quota a run consumes. Know the billing or plan limits of each selected agent.
 
 **Cost scales with `depth × rounds`.** Both flags multiply the per-lens iteration cost: raising `--depth` (within-lens iterations) and `--rounds` (cross-lens orchestration) compounds. In `bugreport` mode, a `--depth 5 --rounds 3` run is roughly **5× the per-lens iteration cost and 3× the lens-pass count** compared to defaults. Preview the resolved estimate with `--dry-run` before launching.
 
@@ -272,6 +305,12 @@ RepoLens supports 12 modes. Each mode controls which domains/lenses are visible 
 
 # Feature — discover missing capabilities
 ./repolens.sh --project ~/my-app --agent codex --mode feature --domain testing
+
+# Cursor subscription — quota-oriented estimates are automatic
+./repolens.sh --project ~/my-app --agent cursor --local --domain security
+
+# Cursor IDE subscription — serve the emitted Composer handoffs
+./repolens.sh --project ~/my-app --agent cursor-ide --local --focus injection
 
 # Bugfix — hunt for real bugs
 ./repolens.sh --project ~/my-app --agent spark --mode bugfix --focus race-conditions
@@ -497,7 +536,7 @@ Usage: repolens.sh --project <path|url> --agent <agent> [OPTIONS]
 | Flag                    | Description                                                         |
 | ----------------------- | ------------------------------------------------------------------------------ |
 | `--project <path\|url>` | Local path, APK file, or remote Git URL (cloned read-only if URL)              |
-| `--agent <agent>`       | `claude \| claude/<model> \| codex \| codex/<model> \| spark \| sparc \| opencode \| opencode/<model> \| antigravity \| antigravity/<model>` |
+| `--agent <agent>`       | `claude \| claude/<model> \| codex \| codex/<model> \| spark \| sparc \| cursor \| cursor/<model> \| cursor-ide \| opencode \| opencode/<model> \| antigravity \| antigravity/<model>` |
 
 ### Optional Flags
 
@@ -513,7 +552,7 @@ Usage: repolens.sh --project <path|url> --agent <agent> [OPTIONS]
 | `--domain <domain-id>` | Run all lenses in one domain (e.g., `security`)                                                                                                                                                                                                                                                          |
 | `--relevant-domains <csv>` | Comma-separated allowlist of domain ids — the "missing middle" between `--focus` (1 lens) and full fan-out. The mode-filtered lens list is intersected with this allowlist; unknown or wrong-mode ids abort startup with the offending token named. Whitespace and empty tokens in the CSV are tolerated. Bypassed when `--focus` or `--domain` is set (those win). Composes with `--scope-by-keywords` (AND semantics) and with the triage-side relevant-domains filter. Example: `--relevant-domains concurrency,database`. |
 | `--scope-by-keywords`  | Deterministic, LLM-free pruning for `--mode bugreport`: case-insensitive substring-match the bug-report text against each domain's optional `keywords` field in `config/domains.json`. Domains without a `keywords` field are always kept (back-compat). A zero-match result falls through with no pruning so the lens list never goes empty. Only effective in `--mode bugreport` (no-op in every other mode). Env fallback: `REPOLENS_SCOPE_BY_KEYWORDS=1`. |
-| `--agent-override <csv>` | Route specific domains or lenses to a different agent than the global `--agent`, trading API cost against reasoning depth — run a cheap model by default and spend a flagship model only where it matters (e.g. `security`, `architecture`). Comma-separated `key=agent` pairs. Each `key` is a domain id or a fully-qualified `domain/lens`; a bare lens id is rejected as ambiguous, since one lens id can live in more than one domain, so lens scope requires the `domain/lens` form. Each `agent` accepts the same values as `--agent` (`claude` \| `claude/<model>` \| `codex` \| `codex/<model>` \| `spark` \| `sparc` \| `opencode` \| `opencode/<model>` \| `antigravity` \| `antigravity/<model>`). Precedence: `domain/lens` > `domain` > global `--agent`. The flag may be repeated; pairs accumulate. Meta agents (synthesis, triage, verification, validation, issue filing) always run on the global `--agent`. An unknown key or an invalid agent aborts startup with the offending token named. When overrides are active, the estimated cost in `--dry-run` and the confirmation prompt is broken down per agent and the active routing map is shown. Example: `--agent opencode --agent-override security=claude,architecture=claude,information-architecture/empty-states=claude`. |
+| `--agent-override <csv>` | Route specific domains or lenses to a different agent than the global `--agent`, trading API cost against reasoning depth — run a cheap model by default and spend a flagship model only where it matters (e.g. `security`, `architecture`). Comma-separated `key=agent` pairs. Each `key` is a domain id or a fully-qualified `domain/lens`; a bare lens id is rejected as ambiguous, since one lens id can live in more than one domain, so lens scope requires the `domain/lens` form. Each `agent` accepts the same values as `--agent` (`claude` \| `claude/<model>` \| `codex` \| `codex/<model>` \| `spark` \| `sparc` \| `cursor` \| `cursor/<model>` \| `cursor-ide` \| `opencode` \| `opencode/<model>` \| `antigravity` \| `antigravity/<model>`). Precedence: `domain/lens` > `domain` > global `--agent`. The flag may be repeated; pairs accumulate. Meta agents (synthesis, triage, verification, validation, issue filing) always run on the global `--agent`. An unknown key or an invalid agent aborts startup with the offending token named. `cursor-ide` overrides require `--local` and force ordered sequential execution. When overrides are active, the estimated cost in `--dry-run` and the confirmation prompt is broken down per agent alongside the active routing map. Example: `--agent opencode --agent-override security=cursor,architecture=claude,information-architecture/empty-states=claude`. |
 | `--parallel`           | Run lenses in parallel (one agent process per lens)                                                                                                                                                                                                                                                      |
 | `--max-parallel <n>`   | Max concurrent agents in parallel mode. When unset the default is nproc-aware: `clamp(detected CPU cores, 8, 32)` (8 on small/CI hosts, up to 32 on many-core machines). An explicit value is always authoritative and is never re-clamped — you can deliberately run below `8` or above `32`. A non-positive-integer value is rejected at startup. Higher concurrency trips provider rate limits faster; pin the detected count with `REPOLENS_NPROC`. |
 | `--resume [<run-id>]`  | Resume a previous interrupted run. With an explicit run id, resume that run. With no id, auto-select and resume the most recent interrupted run under `logs/` (the chosen run is logged) — completed/clean runs and retired (`supersede`d) runs are never auto-picked, and RepoLens errors out (non-zero exit, no fresh run dir created) when no resumable run exists.                                                                                                                                                                                                                                                                      |
@@ -539,7 +578,7 @@ Usage: repolens.sh --project <path|url> --agent <agent> [OPTIONS]
 | `--deploy-target <target>` | Deploy target resolver: `--deploy-target auto\|server\|android`, with `auto` as the default. Only valid with `--mode deploy`. `auto` opportunistically selects Android only for a direct APK, discovered APK, or shallow Android source marker (`gradlew`, `build.gradle`, `build.gradle.kts`, `app/build.gradle`, or `app/build.gradle.kts`); otherwise it preserves live-server deploy behavior. `server` skips Android detection and build handling. Only explicit `--deploy-target android` receives the no-source/no-APK Android exit when no APK or shallow marker exists. |
 | `--build-android-apk` | In Android deploy mode, allow the optional source build fallback to run `./gradlew assembleDebug` when no APK is already resolved. The fallback is gated behind deploy authorization and the normal run confirmation, and is never executed during `--dry-run`. |
 | `--max-cost <amount>`  | Warn if the **minimum cost estimate** exceeds this dollar amount (e.g., `--max-cost 10`). The estimate is a lower bound — real runs typically cost 2–5× more due to tool-call churn and iteration non-convergence. Budget accordingly.                                                                   |
-| `--flat-rate`          | Cost the run as a flat-rate subscription or free tier (Claude Pro, ChatGPT Plus, Gemini Advanced, Google AI Studio free tier, …) instead of pay-as-you-go tokens. Shows `Estimated cost: ~$0.00` plus the expected LLM-call count and the share of a typical message cap / free-tier rate budget the run consumes, so you can weigh a run against your plan's limits. Suppresses the per-token dollar estimate and the "2–5× higher" disclaimer; with `$0.00` marginal cost the `--max-cost` guardrail never trips. Env fallback: `REPOLENS_FLAT_RATE=true`. |
+| `--flat-rate`          | Cost the run as a flat-rate subscription or free tier (Claude Pro, ChatGPT Plus, Gemini Advanced, Google AI Studio free tier, …) instead of pay-as-you-go tokens. Shows `Estimated cost: ~$0.00` plus the expected LLM-call count and the share of a typical message cap / free-tier rate budget the run consumes, so you can weigh a run against your plan's limits. Suppresses the per-token dollar estimate and the "2–5× higher" disclaimer; with `$0.00` marginal cost the `--max-cost` guardrail never trips. Cursor variants already select their Cursor-specific subscription view automatically; passing this flag explicitly selects the generic view. Env fallback: `REPOLENS_FLAT_RATE=true`. |
 | `--cross-link <mode>`  | Synthesizer cross-link strategy: `off` \| `comment` \| `suggest-reopen`. Controls whether the synthesizer links related findings across lenses/domains in the synthesized output. Defaults to `comment` for `bugreport`, `off` for every other mode. Env fallback: `REPOLENS_CROSS_LINK`.                |
 | `--human-review`       | Opt into a curated, noise-budgeted human-review digest at finalize time instead of dumping every finding (a full run can emit hundreds). This is the entry point only: the flag takes no argument, is accepted and validated, and the resolved value is shown by `--dry-run` as `Human review: <bool>`; the digest renderer itself lands in follow-up work, so today the flag changes no output. Env fallback: `REPOLENS_HUMAN_REVIEW=1`. |
 | `--i-know-this-is-expensive` | Cost-acknowledgement gate required for `--rounds >= 4`. Does not bypass the `REPOLENS_MAX_ROUNDS` hard ceiling (default `5`). Equivalent to passing `--max-cost <budget>` together with `--yes`.                                                                                                  |
@@ -609,6 +648,12 @@ REPOLENS_AGENT_TIMEOUT_OPENCODE=3600 ./repolens.sh --project ~/my-app --agent op
 | `REPOLENS_AGENT_TIMEOUT_SPARK`       | unset    | Codex Spark per-invocation timeout override. Wins over `REPOLENS_AGENT_TIMEOUT` and mode-specific timeout variables when `--agent spark` is selected, and also applies to `sparc` when `REPOLENS_AGENT_TIMEOUT_SPARC` is unset.                                                                                                                                                                                                                                                                               |
 | `REPOLENS_AGENT_TIMEOUT_SPARC`       | unset    | SPARC alias per-invocation timeout override. Wins over `REPOLENS_AGENT_TIMEOUT` and mode-specific timeout variables when `--agent sparc` is selected, and also applies to `spark` when `REPOLENS_AGENT_TIMEOUT_SPARK` is unset.                                                                                                                                                                                                                                                                               |
 | `REPOLENS_AGENT_TIMEOUT_ANTIGRAVITY` | unset    | Antigravity per-invocation timeout override. Wins over `REPOLENS_AGENT_TIMEOUT` and mode-specific timeout variables when `--agent antigravity` is selected.                                                                                                                                                                                                                                                                                                                                                   |
+| `REPOLENS_AGENT_TIMEOUT_CURSOR`      | unset    | Cursor per-invocation timeout override. Wins over `REPOLENS_AGENT_TIMEOUT` and mode-specific timeout variables when `--agent cursor`, `--agent cursor/<model>`, or `--agent cursor-ide` is selected.                                                                                                                                                                                                                                                                                                         |
+| `REPOLENS_CURSOR_IDE_MAX_WAIT_SEC`   | unset    | Maximum seconds to wait for each Cursor Composer handoff; defaults to the resolved agent timeout. A timeout stops the attempt as resumable instead of advancing the lens.                                                                                                                                                                                                                                                                                                                               |
+| `REPOLENS_CURSOR_IDE_POLL_SEC`       | `1`      | Seconds between checks for an atomic `complete.json` marker.                                                                                                                                                                                                                                                                                                                                                                             |
+| `REPOLENS_CURSOR_IDE_MIN_RESPONSE_BYTES` | `120` | Minimum non-whitespace response bytes required before an IDE handoff is accepted.                                                                                                                                                                                                                                                                                                                                                        |
+| `REPOLENS_CURSOR_IDE_MIN_PATH_LINE_ANCHORS` | `1` | Minimum real project-relative `path:line` citations required in each lens response.                                                                                                                                                                                                                                                                                                                                                      |
+| `REPOLENS_CURSOR_IDE_HANDOFF_DIR`    | unset    | Optional parent directory for request-scoped IDE handoffs; defaults under `logs/<run-id>/`.                                                                                                                                                                                                                                                                                                                                              |
 | `REPOLENS_AGENT_TIMEOUT_AUDIT`       | `1800`   | Audit-mode timeout when no agent-specific or global override is set.                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `REPOLENS_AGENT_TIMEOUT_FEATURE`     | `1800`   | Feature-mode timeout when no agent-specific or global override is set.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `REPOLENS_AGENT_TIMEOUT_BUGFIX`      | `1800`   | Bugfix-mode timeout when no agent-specific or global override is set.                                                                                                                                                                                                                                                                                                                                                                                                                                        |

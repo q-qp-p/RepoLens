@@ -253,8 +253,8 @@ require_cmd() {
 validate_agent() {
   local agent="$1"
   case "$agent" in
-    claude|codex|spark|sparc|opencode|antigravity) ;;
-    claude/*|codex/*|opencode/*|antigravity/*)
+    claude|codex|spark|sparc|opencode|antigravity|cursor|cursor-ide) ;;
+    claude/*|codex/*|opencode/*|antigravity/*|cursor/*)
       # <agent>/<model> targets a specific model on the CLI (issue #384). The
       # empty-model guard mirrors the original opencode/* one so a trailing slash
       # (a typo) never silently routes to a blank model.
@@ -265,7 +265,7 @@ validate_agent() {
       # /model suffix would fight the preset, so it is rejected with a hint.
       die "Invalid agent: $agent (spark/sparc are fixed presets; use codex/<model> to target a specific model)"
       ;;
-    *) die "Invalid agent: $agent (expected claude, codex, spark/sparc, opencode, antigravity, or <agent>/<model> for claude/codex/opencode/antigravity)" ;;
+    *) die "Invalid agent: $agent (expected claude, codex, spark/sparc, cursor, cursor-ide, opencode, antigravity, or <agent>/<model> for claude/codex/cursor/opencode/antigravity)" ;;
   esac
 }
 
@@ -280,6 +280,8 @@ require_agent_cmd() {
     codex|codex/*|spark|sparc) require_cmd codex ;;
     opencode|opencode/*) require_cmd opencode ;;
     antigravity|antigravity/*) require_cmd agy ;;
+    cursor|cursor/*) require_cmd cursor-agent ;;
+    cursor-ide) ;; # Filesystem handoff to Cursor Composer; no CLI binary.
     *) die "Internal error: unsupported agent '$agent' for command check" ;;
   esac
 }
@@ -385,6 +387,7 @@ resolve_agent_timeout() {
     sparc) agent_vars=(REPOLENS_AGENT_TIMEOUT_SPARC REPOLENS_AGENT_TIMEOUT_SPARK) ;;
     opencode|opencode/*) agent_vars=(REPOLENS_AGENT_TIMEOUT_OPENCODE) ;;
     antigravity|antigravity/*) agent_vars=(REPOLENS_AGENT_TIMEOUT_ANTIGRAVITY) ;;
+    cursor|cursor/*|cursor-ide) agent_vars=(REPOLENS_AGENT_TIMEOUT_CURSOR) ;;
     "") ;;
     *) ;;
   esac
@@ -518,6 +521,69 @@ run_agent() {
         # antigravity/<model> selects a model via `agy --model <model>` (issue
         # #384), keeping the autonomy + headless -p flags proven by #383.
         timeout --kill-after="${kill_grace_secs}s" "${timeout_secs}s" agy --dangerously-skip-permissions --model "${agent#antigravity/}" -p "$prompt"
+        ;;
+      cursor|cursor/*)
+        # Cursor's text format is a progress stream, not the assistant's final
+        # response. Request the terminal JSON envelope, preserve it for failure
+        # classification/debugging, and expose only its .result to the existing
+        # DONE/finding parsers. Bare `cursor` deliberately omits --model so the
+        # CLI's configured/default router remains authoritative.
+        local cursor_model_args=()
+        if [[ "$agent" == cursor/* ]]; then
+          cursor_model_args=(--model "${agent#cursor/}")
+        fi
+
+        local cursor_raw cursor_rc cursor_stderr cursor_stderr_file
+        cursor_stderr_file="$(mktemp "${TMPDIR:-/tmp}/repolens-cursor-stderr.XXXXXX")" || {
+          printf '%s\n' "REPOLENS_CURSOR_ERROR unable to create stderr capture"
+          return 1
+        }
+        cursor_raw="$(
+          timeout --kill-after="${kill_grace_secs}s" "${timeout_secs}s" \
+            cursor-agent --force --print --output-format json \
+            "${cursor_model_args[@]+"${cursor_model_args[@]}"}" "$prompt" \
+            2>"$cursor_stderr_file"
+        )"
+        cursor_rc=$?
+        cursor_stderr="$(cat "$cursor_stderr_file" 2>/dev/null || true)"
+        rm -f -- "$cursor_stderr_file"
+
+        if [[ -n "$envelope_file" ]]; then
+          mkdir -p "$(dirname "$envelope_file")" 2>/dev/null || true
+          printf '%s' "$cursor_raw" > "$envelope_file" 2>/dev/null || true
+        fi
+
+        # Cursor documents that failed invocations may emit no JSON at all and
+        # report the error on stderr. Never accept a result from a non-zero run.
+        if (( cursor_rc != 0 )); then
+          [[ -z "$cursor_raw" ]] || printf '%s\n' "$cursor_raw"
+          [[ -z "$cursor_stderr" ]] || printf '%s\n' "$cursor_stderr" >&2
+          return "$cursor_rc"
+        fi
+
+        if ! command -v jq >/dev/null 2>&1 \
+          || ! printf '%s' "$cursor_raw" | jq -s -e '
+            length == 1
+            and (.[0] | type == "object")
+            and (.[0].type == "result")
+            and (.[0].subtype == "success")
+            and (.[0].is_error == false)
+            and (.[0].result | type == "string")
+          ' >/dev/null 2>&1; then
+          printf '%s\n' "REPOLENS_CURSOR_ERROR malformed or unsuccessful JSON result envelope" >&2
+          [[ -z "$cursor_raw" ]] || printf '%s\n' "$cursor_raw" >&2
+          [[ -z "$cursor_stderr" ]] || printf '%s\n' "$cursor_stderr" >&2
+          return 1
+        fi
+
+        printf '%s' "$cursor_raw" | jq -r '.result'
+        [[ -z "$cursor_stderr" ]] || printf '%s\n' "$cursor_stderr" >&2
+        ;;
+      cursor-ide)
+        if ! declare -F run_cursor_ide_agent >/dev/null 2>&1; then
+          die "Internal error: cursor-ide backend is unavailable (source lib/cursor_ide.sh)"
+        fi
+        run_cursor_ide_agent "$prompt" "$project_path" "$timeout_secs" "$envelope_file"
         ;;
       *)
         die "Internal error: unsupported agent '$agent'"

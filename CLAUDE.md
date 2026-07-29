@@ -23,7 +23,7 @@ RepoLens is a standalone multi-lens code audit tool. It runs 335 expert analysis
 - **DONE x3 streak** — Each lens loops until the agent outputs DONE as first or last word, 3 consecutive times (discover and deploy modes use 1x streak — single-pass)
 - **Mode isolation** — Discover and deploy modes have their own exclusive domains (`discovery` with 14 lenses, `deployment` with 26 lenses, and `android` with 17 lenses). The `"mode"` field in `domains.json` controls lens visibility: each mode only sees domains matching its mode, other modes exclude them
 - **Deploy mode** — Runs on a live server. Agents use bash commands (systemctl, ss, df, journalctl, etc.) to investigate server state. Prompts enforce read-only operation. The `--project` path does not need to be a git repo in deploy mode
-- **Agent-agnostic** — Supports claude, codex, spark/sparc, opencode via `--agent` flag
+- **Agent-agnostic** — Supports claude, codex, spark/sparc, Cursor CLI, Cursor IDE/Composer handoff, opencode, and Antigravity via `--agent`
 - **Prompt composition** — Base template provides universal rules, lens template provides expert focus. `lib/template.sh` concatenates and substitutes `{{VARIABLES}}`
 - **Parallel execution** — File-based semaphore in `logs/<run-id>/.semaphore/`, signal handler for clean shutdown
 - **Resume support** — `--resume <run-id>` skips already-completed lenses
