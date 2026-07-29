@@ -74,12 +74,118 @@ cursor_ide_response_git_hash() {
   git hash-object --no-filters "$1" 2>/dev/null
 }
 
+# Return a stable identity for one regular, non-symlink file. GNU and BSD stat
+# use different switches, so support both without adding a new dependency.
+cursor_ide_regular_file_identity() {
+  local file="$1"
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  if stat -c '%d:%i:%s:%Y' -- "$file" 2>/dev/null; then
+    return 0
+  fi
+  stat -f '%d:%i:%z:%m' "$file" 2>/dev/null
+}
+
+# Copy a handoff artifact into an invocation-private destination and prove the
+# source stayed the same regular file throughout the copy. Validation and
+# consumption use only this snapshot, never the Composer-writable source path.
+cursor_ide_snapshot_regular_file() {
+  local source="$1" destination="$2" description="${3:-handoff file}"
+  local before_identity after_identity temp_snapshot
+
+  [[ -f "$source" && ! -L "$source" ]] || {
+    printf '%s\n' "$description is missing or is not a regular file"
+    return 1
+  }
+  before_identity="$(cursor_ide_regular_file_identity "$source")" || {
+    printf '%s\n' "unable to identify $description before snapshot"
+    return 1
+  }
+  [[ ! -e "$destination" && ! -L "$destination" ]] || {
+    printf '%s\n' "private snapshot destination already exists for $description"
+    return 1
+  }
+
+  temp_snapshot="$(mktemp "${destination}.tmp.XXXXXX")" || {
+    printf '%s\n' "unable to allocate private snapshot for $description"
+    return 1
+  }
+  chmod 600 "$temp_snapshot" || {
+    rm -f -- "$temp_snapshot"
+    printf '%s\n' "unable to protect private snapshot for $description"
+    return 1
+  }
+  if ! cp -- "$source" "$temp_snapshot"; then
+    rm -f -- "$temp_snapshot"
+    printf '%s\n' "unable to copy $description into a private snapshot"
+    return 1
+  fi
+  [[ -f "$source" && ! -L "$source" ]] || {
+    rm -f -- "$temp_snapshot"
+    printf '%s\n' "$description changed type or became a symlink while it was being snapshotted"
+    return 1
+  }
+  after_identity="$(cursor_ide_regular_file_identity "$source")" || {
+    rm -f -- "$temp_snapshot"
+    printf '%s\n' "unable to identify $description after snapshot"
+    return 1
+  }
+  if [[ "$before_identity" != "$after_identity" ]]; then
+    rm -f -- "$temp_snapshot"
+    printf '%s\n' "$description was replaced or changed while it was being snapshotted"
+    return 1
+  fi
+  [[ -f "$temp_snapshot" && ! -L "$temp_snapshot" ]] || {
+    rm -f -- "$temp_snapshot"
+    printf '%s\n' "private snapshot for $description is not a regular file"
+    return 1
+  }
+  mv -- "$temp_snapshot" "$destination" || {
+    rm -f -- "$temp_snapshot"
+    printf '%s\n' "unable to publish private snapshot for $description"
+    return 1
+  }
+  chmod 600 "$destination" || {
+    rm -f -- "$destination"
+    printf '%s\n' "unable to protect published snapshot for $description"
+    return 1
+  }
+}
+
 cursor_ide_extract_path_line_anchors() {
   local response_file="$1"
   [[ -f "$response_file" ]] || return 0
   grep -oE '[A-Za-z0-9_.+@/-]+\.[A-Za-z0-9]+:[0-9]+' "$response_file" 2>/dev/null \
     | sed 's#^\./##' \
     | sort -u
+}
+
+CURSOR_IDE_PROJECT_ANCHOR_FILE=""
+
+# Resolve a citation without following any symlink component. A path that
+# happens to exist through project/link -> /outside is not project evidence.
+cursor_ide_resolve_project_anchor_file() {
+  local project_path="$1" relative="$2"
+  local project_root current component parent canonical_parent
+  local -a components=()
+  CURSOR_IDE_PROJECT_ANCHOR_FILE=""
+
+  [[ -n "$relative" && "$relative" != /* ]] || return 1
+  project_root="$(cd -- "$project_path" 2>/dev/null && pwd -P)" || return 1
+  IFS='/' read -r -a components <<< "$relative"
+  current="$project_root"
+  for component in "${components[@]}"; do
+    [[ -n "$component" && "$component" != "." && "$component" != ".." ]] || return 1
+    current="$current/$component"
+    [[ ! -L "$current" ]] || return 1
+  done
+  [[ -f "$current" ]] || return 1
+  parent="$(dirname -- "$current")"
+  canonical_parent="$(cd -- "$parent" 2>/dev/null && pwd -P)" || return 1
+  case "$canonical_parent" in
+    "$project_root"|"$project_root"/*) ;;
+    *) return 1 ;;
+  esac
+  CURSOR_IDE_PROJECT_ANCHOR_FILE="$current"
 }
 
 cursor_ide_count_verified_anchors() {
@@ -91,13 +197,13 @@ cursor_ide_count_verified_anchors() {
     relative="${anchor%:*}"
     cited_line="${anchor##*:}"
     [[ "$relative" != /* && "$relative" != *"../"* && "$relative" != ".." ]] || continue
-    if [[ -f "$project_path/$relative" ]] \
-      && awk -v cited_line="$cited_line" '
+    cursor_ide_resolve_project_anchor_file "$project_path" "$relative" || continue
+    if awk -v cited_line="$cited_line" '
         END {
           valid = cited_line ~ /^[0-9]+$/ && (cited_line + 0) >= 1 && (cited_line + 0) <= NR
           exit !valid
         }
-      ' "$project_path/$relative"; then
+      ' "$CURSOR_IDE_PROJECT_ANCHOR_FILE"; then
       count=$((count + 1))
     fi
   done < <(cursor_ide_extract_path_line_anchors "$response_file")
@@ -317,6 +423,7 @@ run_cursor_ide_agent() {
   fi
 
   local poll_seconds max_wait waited=0 rejection_reason rejection_json
+  local snapshot_dir response_snapshot complete_snapshot snapshot_ok
   poll_seconds="${REPOLENS_CURSOR_IDE_POLL_SEC:-1}"
   max_wait="${REPOLENS_CURSOR_IDE_MAX_WAIT_SEC:-$timeout_seconds}"
   [[ "$poll_seconds" =~ ^[1-9][0-9]*$ ]] || poll_seconds=1
@@ -325,10 +432,41 @@ run_cursor_ide_agent() {
 
   while (( waited < max_wait )); do
     if [[ -e "$complete_file" ]]; then
-      if rejection_reason="$(
-        cursor_ide_validate_response \
-          "$response_file" "$complete_file" "$request_id" "$project_path" "$phase"
+      snapshot_ok=true
+      rejection_reason=""
+      if ! snapshot_dir="$(
+        mktemp -d "${TMPDIR:-/tmp}/repolens-cursor-ide.${BASHPID}.XXXXXX"
       )"; then
+        rejection_reason="unable to allocate invocation-private Cursor IDE snapshot directory"
+        snapshot_ok=false
+      fi
+      if $snapshot_ok && ! chmod 700 "$snapshot_dir"; then
+        rejection_reason="unable to protect invocation-private Cursor IDE snapshot directory"
+        snapshot_ok=false
+      fi
+      response_snapshot="$snapshot_dir/response.md"
+      complete_snapshot="$snapshot_dir/complete.json"
+      if $snapshot_ok; then
+        if ! rejection_reason="$(
+          cursor_ide_snapshot_regular_file \
+            "$response_file" "$response_snapshot" "response.md"
+        )"; then
+          snapshot_ok=false
+        elif ! rejection_reason="$(
+          cursor_ide_snapshot_regular_file \
+            "$complete_file" "$complete_snapshot" "complete.json"
+        )"; then
+          snapshot_ok=false
+        elif ! rejection_reason="$(
+          cursor_ide_validate_response \
+            "$response_snapshot" "$complete_snapshot" \
+            "$request_id" "$project_path" "$phase"
+        )"; then
+          snapshot_ok=false
+        fi
+      fi
+
+      if $snapshot_ok; then
         local accepted_json
         accepted_json="$(jq -nc \
           --argjson schema_version 1 \
@@ -337,10 +475,20 @@ run_cursor_ide_agent() {
           --arg phase "$phase" \
           '{schema_version: $schema_version, kind: $kind, request_id: $request_id, phase: $phase}')"
         cursor_ide_emit "$accepted_json"
-        cat "$response_file"
+        if ! cat -- "$response_snapshot"; then
+          rm -f -- "$response_snapshot" "$complete_snapshot"
+          rmdir -- "$snapshot_dir" 2>/dev/null || true
+          return 1
+        fi
+        rm -f -- "$response_snapshot" "$complete_snapshot"
+        rmdir -- "$snapshot_dir" 2>/dev/null || true
         return 0
       fi
 
+      if [[ -n "$snapshot_dir" && -d "$snapshot_dir" && ! -L "$snapshot_dir" ]]; then
+        rm -f -- "$response_snapshot" "$complete_snapshot"
+        rmdir -- "$snapshot_dir" 2>/dev/null || true
+      fi
       rejection_json="$(jq -nc \
         --argjson schema_version 1 \
         --arg kind "cursor_ide_response_rejected" \

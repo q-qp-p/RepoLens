@@ -49,7 +49,7 @@ mv -- complete.json.tmp complete.json
 
 Always use the absolute paths embedded in that request's prompt rather than the illustrative relative names above.
 
-RepoLens accepts the result only when the request id and response hash match. It also rejects symlinks, binary/short responses, and lens responses without the required structure and verified citations. A rejection produces a `cursor_ide_response_rejected` event, removes only `complete.json`, and continues waiting so Composer can fix the same response and publish a new marker.
+RepoLens first copies `response.md` and `complete.json` into invocation-private, mode-600 regular files while checking that neither source is replaced or changed into a symlink during the copy. It validates and consumes only those snapshots, so an edit after acceptance cannot change the bytes delivered to the pipeline. RepoLens accepts the result only when the snapshotted request id and response hash match. It also rejects binary/short responses and lens responses without the required structure and project-local citations; citations through symlinked project path components do not count as evidence. A rejection produces a `cursor_ide_response_rejected` event, removes only `complete.json`, and continues waiting so Composer can fix the same response and publish a new marker.
 
 Keep servicing events until `kind` is `run_complete`.
 

@@ -87,6 +87,16 @@ assert_file_missing() {
   fi
 }
 
+assert_files_equal() {
+  local desc="$1" expected="$2" actual="$3"
+  TOTAL=$((TOTAL + 1))
+  if cmp -s -- "$expected" "$actual"; then
+    pass_with "$desc"
+  else
+    fail_with "$desc" "files differ: expected=$expected actual=$actual"
+  fi
+}
+
 wait_for_request() {
   local root="$1" attempts="${2:-100}" request=""
   local i
@@ -160,6 +170,47 @@ assert_eq "cursor-ide requires no external CLI" "0" "$?"
 
 out="$(REPOLENS_AGENT_TIMEOUT_CURSOR=19 resolve_agent_timeout audit cursor-ide)"
 assert_eq "cursor-ide uses the Cursor timeout class" "19" "$out"
+
+printf '\n%s\n' "=== Snapshot race boundary ==="
+
+snapshot_race_dir="$TMPDIR/snapshot-race"
+snapshot_race_bin="$snapshot_race_dir/bin"
+snapshot_race_source_dir="$snapshot_race_dir/source"
+snapshot_race_private="$snapshot_race_dir/private"
+snapshot_race_marker="$snapshot_race_dir/cp-raced"
+snapshot_race_target="$snapshot_race_dir/outside.md"
+snapshot_race_source="$snapshot_race_source_dir/response.md"
+snapshot_race_destination="$snapshot_race_private/response.md"
+snapshot_race_real_cp="$(command -v cp)"
+mkdir -p "$snapshot_race_bin" "$snapshot_race_source_dir" "$snapshot_race_private"
+printf '%s\n' "trusted response bytes" > "$snapshot_race_source"
+printf '%s\n' "symlink target bytes" > "$snapshot_race_target"
+cat > "$snapshot_race_bin/cp" <<'SHIM'
+#!/usr/bin/env bash
+source_path="${2:-}"
+if [[ "$source_path" == */response.md && ! -e "${CURSOR_IDE_RACE_MARKER:?}" ]]; then
+  mv -- "$source_path" "${source_path}.before-race"
+  ln -s -- "${CURSOR_IDE_RACE_TARGET:?}" "$source_path"
+  : > "$CURSOR_IDE_RACE_MARKER"
+fi
+exec "${CURSOR_IDE_REAL_CP:?}" "$@"
+SHIM
+chmod +x "$snapshot_race_bin/cp"
+snapshot_race_reason="$(
+  PATH="$snapshot_race_bin:$PATH" \
+  CURSOR_IDE_RACE_MARKER="$snapshot_race_marker" \
+  CURSOR_IDE_RACE_TARGET="$snapshot_race_target" \
+  CURSOR_IDE_REAL_CP="$snapshot_race_real_cp" \
+    cursor_ide_snapshot_regular_file \
+      "$snapshot_race_source" "$snapshot_race_destination" "response.md"
+)"
+snapshot_race_rc=$?
+assert_eq "a response changed to a symlink during copy is rejected" "1" \
+  "$snapshot_race_rc"
+assert_contains "snapshot race rejection identifies the type change" \
+  "changed type or became a symlink" "$snapshot_race_reason"
+assert_file_missing "a raced copy never publishes a private snapshot" \
+  "$snapshot_race_destination"
 
 printf '\n%s\n' "=== Request binding, rejection, and acceptance ==="
 
@@ -246,15 +297,106 @@ assert_contains "out-of-bounds rejection explains the line-bound requirement" \
   "in-bounds project path:line" \
   "$(jq -r 'select(.kind == "cursor_ide_response_rejected") | .reason' "$ctl_log" | tail -1)"
 
+# A path beneath a symlinked project component is not project-local evidence.
+outside_anchor_dir="$TMPDIR/outside-anchor"
+mkdir -p "$outside_anchor_dir"
+printf '%s\n' "outside project" > "$outside_anchor_dir/evidence.md"
+ln -s "$outside_anchor_dir" "$project/linked-evidence"
+write_response_body "$request_file" "linked-evidence/evidence.md:1"
+response_hash="$(git hash-object --no-filters "$response_file")"
+jq -n \
+  --arg request_id "$request_id" \
+  --arg response_git_hash "$response_hash" \
+  '{schema_version: 1, request_id: $request_id, status: "complete", response_git_hash: $response_git_hash}' \
+  > "$complete_file"
+for _ in {1..60}; do
+  [[ ! -e "$complete_file" ]] && break
+  sleep 0.05
+done
+assert_file_missing "citation through a symlinked project component is rejected" \
+  "$complete_file"
+assert_contains "symlink-escape citation does not count as project evidence" \
+  "in-bounds project path:line" \
+  "$(jq -r 'select(.kind == "cursor_ide_response_rejected") | .reason' "$ctl_log" | tail -1)"
+
 write_valid_response "$request_file"
 wait "$direct_pid"
 direct_rc=$?
 assert_eq "valid bound response completes the handoff" "0" "$direct_rc"
 assert_contains "accepted output reaches RepoLens" "No fileable injection finding remains" "$(cat "$direct_out")"
-assert_eq "protocol records all rejected markers" "3" \
+assert_eq "protocol records all rejected markers" "4" \
   "$(jq -s '[.[] | select(.kind == "cursor_ide_response_rejected")] | length' "$ctl_log")"
 assert_eq "protocol records one accepted response" "1" \
   "$(jq -s '[.[] | select(.kind == "cursor_ide_response_accepted")] | length' "$ctl_log")"
+
+printf '\n%s\n' "=== Accepted bytes are immutable after validation ==="
+
+replacement_root="$TMPDIR/replacement-handoffs"
+replacement_ctl_log="$TMPDIR/replacement-events.ndjson"
+replacement_out="$TMPDIR/replacement.out"
+replacement_err="$TMPDIR/replacement.err"
+replacement_expected="$TMPDIR/replacement-expected.md"
+replacement_payload="$TMPDIR/replacement-payload.md"
+printf '%s\n' "UNVALIDATED REPLACEMENT BYTES" > "$replacement_payload"
+(
+  eval "$(declare -f cursor_ide_emit | sed '1s/cursor_ide_emit/cursor_ide_emit_before_replacement/')"
+  cursor_ide_emit() {
+    local json="$1" kind source_file
+    kind="$(jq -r '.kind // empty' <<< "$json")"
+    if [[ "$kind" == "cursor_ide_response_accepted" ]]; then
+      source_file="$(find "$replacement_root" -type f -name response.md 2>/dev/null | head -1)"
+      if [[ -n "$source_file" ]]; then
+        mv -- "$source_file" "${source_file}.validated"
+        ln -s -- "$replacement_payload" "$source_file"
+      fi
+    fi
+    cursor_ide_emit_before_replacement "$json"
+  }
+  REPOLENS_CURSOR_IDE_PHASE=lens \
+  REPOLENS_CURSOR_IDE_DOMAIN=security \
+  REPOLENS_CURSOR_IDE_LENS=injection \
+  REPOLENS_CURSOR_IDE_ITERATION=1 \
+  REPOLENS_CURSOR_IDE_HANDOFF_DIR="$replacement_root" \
+  REPOLENS_CURSOR_IDE_CTL_LOG="$replacement_ctl_log" \
+  REPOLENS_CURSOR_IDE_POLL_SEC=1 \
+  REPOLENS_CURSOR_IDE_MAX_WAIT_SEC=8 \
+    run_agent cursor-ide "AUDIT IMMUTABLE BYTES" "$project" 8 1
+) > "$replacement_out" 2> "$replacement_err" &
+replacement_pid=$!
+replacement_request="$(wait_for_request "$replacement_root" 120)"
+write_response_body "$replacement_request"
+replacement_response="$(jq -r '.files.response' "$replacement_request")"
+replacement_complete="$(jq -r '.files.complete' "$replacement_request")"
+replacement_request_id="$(jq -r '.request_id' "$replacement_request")"
+cp -- "$replacement_response" "$replacement_expected"
+replacement_hash="$(git hash-object --no-filters "$replacement_response")"
+jq -n \
+  --arg request_id "$replacement_request_id" \
+  --arg response_git_hash "$replacement_hash" \
+  '{schema_version: 1, request_id: $request_id, status: "complete", response_git_hash: $response_git_hash}' \
+  > "$replacement_complete"
+wait "$replacement_pid"
+replacement_rc=$?
+assert_eq "post-validation source replacement does not fail accepted handoff" "0" \
+  "$replacement_rc"
+if [[ -L "$replacement_response" ]]; then
+  pass_with "race hook replaced the shared response after acceptance"
+  TOTAL=$((TOTAL + 1))
+else
+  fail_with "race hook replaced the shared response after acceptance"
+  TOTAL=$((TOTAL + 1))
+fi
+assert_files_equal "RepoLens consumes exactly the validated snapshot bytes" \
+  "$replacement_expected" "$replacement_out"
+assert_contains "replacement payload never reaches RepoLens output" \
+  "No fileable injection finding remains" "$(cat "$replacement_out")"
+if grep -qF "UNVALIDATED REPLACEMENT BYTES" "$replacement_out"; then
+  fail_with "unvalidated replacement bytes are excluded from output"
+  TOTAL=$((TOTAL + 1))
+else
+  pass_with "unvalidated replacement bytes are excluded from output"
+  TOTAL=$((TOTAL + 1))
+fi
 
 printf '\n%s\n' "=== Timeout and public CLI policy ==="
 
