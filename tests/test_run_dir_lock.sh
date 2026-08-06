@@ -27,6 +27,17 @@ source "$SCRIPT_DIR/tests/status_test_lib.sh"
 RUN_PIDS=()
 STARTED_PID=""
 
+# --resume requires an existing, real (non-symlink) logs/<run-id> directory
+# before it will open any artifact below it. Every scenario here resumes a
+# freshly minted run id, so the directory has to be created up front — without
+# it repolens.sh dies during argument handling and never reaches the lock
+# semantics these tests are about.
+register_run_dir() {
+  local id="$1"
+  status_register_run_id "$id"
+  mkdir -p "$STATUS_TEST_ROOT/logs/$id"
+}
+
 # shellcheck disable=SC2329  # Invoked indirectly by the EXIT trap.
 cleanup() {
   local pid
@@ -169,7 +180,7 @@ chmod +x "$FAKE_BIN/codex"
 #    the first process is still inside the public agent execution path.
 # ---------------------------------------------------------------------------
 RUN_ID="test-run-dir-lock-same-$$-$RANDOM"
-status_register_run_id "$RUN_ID"
+register_run_dir "$RUN_ID"
 FIRST_READY="$STATUS_TEST_TMPDIR/first.ready"
 FIRST_OUT="$STATUS_TEST_TMPDIR/first.out"
 SECOND_OUT="$STATUS_TEST_TMPDIR/second.out"
@@ -195,7 +206,7 @@ kill_run_group_now "$FIRST_PID"
 #    resume of the same run should acquire ownership and proceed normally.
 # ---------------------------------------------------------------------------
 RUN_ID="test-run-dir-lock-crash-$$-$RANDOM"
-status_register_run_id "$RUN_ID"
+register_run_dir "$RUN_ID"
 CRASH_READY="$STATUS_TEST_TMPDIR/crash.ready"
 CRASH_OUT="$STATUS_TEST_TMPDIR/crash.out"
 RECLAIM_OUT="$STATUS_TEST_TMPDIR/reclaim.out"
@@ -221,7 +232,7 @@ assert_not_contains "Resume after SIGKILL does not report an owned run" \
 #    surviving agent child could keep a killed orchestrator's lock alive.
 # ---------------------------------------------------------------------------
 RUN_ID="test-run-dir-lock-agent-fd-$$-$RANDOM"
-status_register_run_id "$RUN_ID"
+register_run_dir "$RUN_ID"
 AGENT_FD_OUT="$STATUS_TEST_TMPDIR/agent-fd.out"
 AGENT_FD_REPORT="$STATUS_TEST_TMPDIR/agent-fd.report"
 
@@ -240,8 +251,8 @@ assert_contains "Agent subprocess does not inherit the run-lock FD" \
 # ---------------------------------------------------------------------------
 RUN_ID_A="test-run-dir-lock-a-$$-$RANDOM"
 RUN_ID_B="test-run-dir-lock-b-$$-$RANDOM"
-status_register_run_id "$RUN_ID_A"
-status_register_run_id "$RUN_ID_B"
+register_run_dir "$RUN_ID_A"
+register_run_dir "$RUN_ID_B"
 READY_A="$STATUS_TEST_TMPDIR/a.ready"
 READY_B="$STATUS_TEST_TMPDIR/b.ready"
 OUT_A="$STATUS_TEST_TMPDIR/a.out"
@@ -276,7 +287,7 @@ STATUS_RUN_OUT="$STATUS_TEST_TMPDIR/status-run.out"
 STATUS_OUT="$STATUS_TEST_TMPDIR/status.out"
 STATUS_ERR="$STATUS_TEST_TMPDIR/status.err"
 mkdir -p "$RUN_DIR"
-status_register_run_id "$RUN_ID"
+register_run_dir "$RUN_ID"
 jq --arg run "$RUN_ID" '.run_id = $run' \
   "$STATUS_TEST_ROOT/tests/fixtures/status_active.json" > "$RUN_DIR/status.json"
 

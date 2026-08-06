@@ -280,7 +280,7 @@ For the full legal text, see [LICENSE](LICENSE) (Apache License, Version 2.0, Se
 
 ## Modes
 
-RepoLens supports 12 modes. Each mode controls which domains/lenses are visible and how the agent iterates. `polish` is a suggestion workflow that writes ranked JSON artifacts and grouped polishing shortlists.
+RepoLens supports 13 modes. Each mode controls which domains/lenses are visible and how the agent iterates. `polish` is a suggestion workflow that writes ranked JSON artifacts and grouped polishing shortlists.
 
 | Mode         | DONE Streak | Domains                                    | Description                                                                   |
 | ------------ | ----------- | ------------------------------------------ | ----------------------------------------------------------------------------- |
@@ -296,6 +296,7 @@ RepoLens supports 12 modes. Each mode controls which domains/lenses are visible 
 | `greenfield` | 1×          | `greenfield` domain (1 lenses)             | Spec-to-backlog planning — requires `--spec` or `--spec-dir`, checks the current open issue or local draft backlog, and creates non-duplicate `[P0]`-`[P3]` implementation issues without inspecting repository code |
 | `polish`     | 1×          | `fluency`, `effort-signal`, and `hedonic` domains (16 lenses) | Ranked polishing shortlists — proposes small, additive craft refinements with voice-fit evidence |
 | `spec-change` | 1×         | `spec-change` domain (1 lenses)            | Spec-diff impact — requires a tracked `--spec` file or an in-repository `--spec-dir`, diffs it against `--spec-base` (default `HEAD`), and files one impact-prefixed issue per code change the diff implies |
+| `branch-review` | 1×       | 27 code/toolgate/logs domains (248 lenses) | Branch regression review — requires `--branch-base <ref>`, diffs the checked-out head against the merge base it shares with that ref, and files one `[REGRESSION]` issue per defect the branch introduced (pre-existing defects are out of scope) |
 
 ### Mode Examples
 
@@ -363,6 +364,14 @@ RepoLens supports 12 modes. Each mode controls which domains/lenses are visible 
 # Spec change — analyze changes across a tracked specification directory
 ./repolens.sh --project ~/my-app --agent claude --mode spec-change \
   --spec-dir ~/my-app/docs/spec --spec-entry index.md
+
+# Branch review — file only the regressions this branch introduced vs main
+./repolens.sh --project ~/my-app --agent claude --mode branch-review --branch-base main
+
+# Branch review — name the head explicitly (it must be the checked-out ref) and use a tag as base
+git -C ~/my-app switch feature/checkout-rewrite
+./repolens.sh --project ~/my-app --agent claude --mode branch-review \
+  --branch-base v2.4.0 --branch-head feature/checkout-rewrite --parallel
 
 # Polish — file ranked polishing shortlists
 ./repolens.sh --project ~/my-app --agent claude --mode polish
@@ -468,6 +477,29 @@ In forge mode, polishing shortlists are created as remote issues with `polish:<d
 logs/<run-id>/polish/filed/
 ```
 
+## Branch review mode
+
+Use `branch-review` when you want only the damage a branch did, not a verdict on the whole repository. Use `audit` when you want every defect in the codebase regardless of who introduced it.
+
+```bash
+git -C ~/my-app switch feature/checkout-rewrite
+./repolens.sh --project ~/my-app --agent claude --mode branch-review --branch-base main
+```
+
+`--branch-base` is required and names the ref the branch is compared against. `--branch-head` defaults to `HEAD` and must resolve to the checked-out commit — lenses read the working tree, so a head that is not checked out would be reviewed against files that are not on disk.
+
+The delta is **three-dot**: everything the head added on top of the merge base it shares with the base ref, equivalent to `git diff main...HEAD`. A two-dot comparison would report commits that exist only on the base as things the branch deleted, and every one of those would be filed as a regression the branch never caused.
+
+Each lens must clear a two-part test before it may file anything: the defect must be present at the head **and** absent at the merge base. Problems that already existed at the merge base are out of scope no matter how severe they look, as is a pre-existing bug the branch merely moved, reindented, or reformatted. Every issue carries a `Before / After` section and evidence anchors on both sides, so a claim with no base-side proof cannot be filed.
+
+Branch review runs the full code-analysis lens fleet — the same 248 lenses `audit` sees — at a `1×` DONE streak, and `--min-severity` applies as usual. Findings are filed with a `[REGRESSION]` title prefix (for example `[REGRESSION][HIGH] …`) and a `regression:<domain>/<lens-id>` label. A small branch still dispatches all 248 lenses, so read [Warnings & Limits → Cost](#cost--repolens-can-be-very-expensive) first, and narrow the run with `--domain` or `--relevant-domains` when the branch only touches one area.
+
+The complete patch is written once to `logs/<run-id>/branch-diff.txt`, and a bounded manifest — base, head, and merge-base commits, the changed-file list, and the diffstat — to `logs/<run-id>/branch-manifest.md`. Only the manifest is placed in lens prompts, so a large branch does not inflate every prompt; lenses read per-file patches on demand from the recorded commits. `--dry-run` prints all three (base, head, merge base) plus both artifact paths before anything runs.
+
+An empty delta is a successful run, not an error: the lenses see an explicit "no changes" notice, file nothing, and the run exits `0`. These conditions stop the run before any agent is dispatched, each naming the offending ref: a base or head ref that does not resolve locally, a base ref with no shared history (with a `git fetch --unshallow` hint when the checkout is shallow), and a `--branch-head` that is not the checked-out commit. An uncommitted working tree is only a warning — the delta covers committed state.
+
+Resuming a branch review rehydrates the base ref and the three commits from the persisted manifest instead of recomputing them, so a resumed run reviews the identical delta even if the branch moved on. `--branch-base` is therefore optional on resume; passing one that disagrees with the persisted value stops the run.
+
 ## Remote deploy mode
 
 Remote deploy mode lets you run deploy-mode server lenses from your workstation while inspecting a server over SSH. Use it only for server targets; it is rejected with `--hosted` and Android deploy targets.
@@ -485,7 +517,7 @@ Forge actions still happen on the operator workstation. `gh`, `tea`, or `fj` iss
 These flags scale RepoLens beyond the simple [Quickstart](#quickstart) invocations. They compound cost — read [Warnings & Limits → Cost](#cost--repolens-can-be-very-expensive) before raising either.
 
 - **`--depth N`** — within-lens iteration depth. The DONE-streak length the agent must reach (the agent outputs `DONE` as the first or last word `N` times consecutively) before the lens is considered complete. Defaults to `3` for `audit`, `feature`, and `bugfix`; defaults to `1` for every other mode (including `bugreport`). Supersedes the legacy `DONE_STREAK_REQUIRED` env var (honored as a fallback when `--depth` is unset, deprecated). Must be between `1` and `19`.
-- **`--rounds N`** — multi-round investigation orchestrated by a meta-orchestrator that re-prioritizes lenses across rounds based on prior-round findings. Defaults to `1` except `bugreport`, which defaults to `3`. Only `bugreport` accepts values above `1` (cap `10`); `audit`, `feature`, `bugfix`, `custom`, `deploy`, `opensource`, `content`, `discover`, `greenfield`, and `polish` are locked to `1`.
+- **`--rounds N`** — multi-round investigation orchestrated by a meta-orchestrator that re-prioritizes lenses across rounds based on prior-round findings. Defaults to `1` except `bugreport`, which defaults to `3`. Only `bugreport` accepts values above `1` (cap `10`); `audit`, `feature`, `bugfix`, `custom`, `deploy`, `opensource`, `content`, `discover`, `greenfield`, `polish`, and `branch-review` are locked to `1`.
 
 ### Example invocations
 
@@ -542,7 +574,7 @@ Usage: repolens.sh --project <path|url> --agent <agent> [OPTIONS]
 
 | Flag                   | Description                                                                                                                                                                                                                                                                                              |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--mode <mode>`        | `audit` (default) \| `feature` \| `bugfix` \| `bugreport` \| `discover` \| `deploy` \| `custom` \| `opensource` \| `content` \| `greenfield` \| `polish` \| `spec-change`                                                                                                                            |
+| `--mode <mode>`        | `audit` (default) \| `feature` \| `bugfix` \| `bugreport` \| `discover` \| `deploy` \| `custom` \| `opensource` \| `content` \| `greenfield` \| `polish` \| `spec-change` \| `branch-review`                                                                                                         |
 | `--bug-report <file\|text>` | Required for `--mode bugreport`. Path to a text file or inline symptom text (read verbatim). Env fallback: `REPOLENS_BUG_REPORT_PATH`. 100 KB max for file mode.                                                                                                                                  |
 | `--change <statement>` | Change impact statement (implies `--mode custom`)                                                                                                                                                                                                                                                        |
 | `--source <file>`      | Source material (PDF, text, markdown) for content creation or reference                                                                                                                                                                                                                                  |
@@ -563,10 +595,12 @@ Usage: repolens.sh --project <path|url> --agent <agent> [OPTIONS]
 | `--spec-entry <file>`  | Included path relative to `--spec-dir` to present first. Presentation order does not establish requirement precedence. Requires `--spec-dir`.                                                                                                                                                         |
 | `--spec-exclude <pattern>` | Exclude paths relative to `--spec-dir`. May be repeated or contain comma-separated patterns; exclusions win over includes. Requires `--spec-dir`.                                                                                                                                                  |
 | `--spec-base <ref>`    | Git base for `spec-change` (default `HEAD`). Directory bundles require a single ref that resolves to a Git tree; the legacy single-file form also retains its existing ref/range support.                                                                                                              |
+| `--branch-base <ref>`  | Base ref the review head is compared against. Required for `--mode branch-review` (except on `--resume`, which reads it back from the run's manifest) and rejected in every other mode. The delta is three-dot — everything the head added on top of the merge base it shares with this ref — so commits that exist only on the base are never reported as branch changes. A ref that does not resolve locally stops the run before any agent starts (fetch it first if it only exists on the remote). |
+| `--branch-head <ref>`  | Review head for `--mode branch-review` (default: `HEAD`). Must resolve to the checked-out commit, because lenses read the working tree — reviewing a head that is not checked out would pair a diff from one commit with source from another. Rejected outside `branch-review`.                        |
 | `--max-issues <n>`     | Stop after creating _n_ total issues. In polish mode, this caps emitted polishing shortlist issues rather than individual suggestions                                                                                                                                                                    |
 | `--min-severity <level>` | Only file findings at or above `critical`, `high`, `medium`, or `low`. Filtered findings are counted in `summary.json` and reported in final stdout when the count is non-zero. No effect in non-severity modes such as `discover`, `feature`, `custom`, `greenfield`, and `polish`. Env fallback: `REPOLENS_MIN_SEVERITY`. |
 | `--depth <n>`          | DONE streak depth per lens. Defaults to `3` for `audit`, `feature`, and `bugfix`; defaults to `1` for all other modes. Must be between `1` and `19`                                                                                        |
-| `--rounds <n>`         | Validated cross-lens round count for multi-round orchestration. Defaults to `1` except `bugreport`, which defaults to `3`. Only `bugreport` accepts values above `1`; `audit`, `feature`, `bugfix`, `custom`, `deploy`, `opensource`, `content`, `discover`, `greenfield`, `polish`, and `spec-change` are locked to `1`. `--rounds >= 4` requires `--i-know-this-is-expensive`. The resolved value is shown by `--dry-run` and sizes the `logs/<run-id>/rounds/round-N/` artifact layout |
+| `--rounds <n>`         | Validated cross-lens round count for multi-round orchestration. Defaults to `1` except `bugreport`, which defaults to `3`. Only `bugreport` accepts values above `1`; `audit`, `feature`, `bugfix`, `custom`, `deploy`, `opensource`, `content`, `discover`, `greenfield`, `polish`, `spec-change`, and `branch-review` are locked to `1`. `--rounds >= 4` requires `--i-know-this-is-expensive`. The resolved value is shown by `--dry-run` and sizes the `logs/<run-id>/rounds/round-N/` artifact layout |
 | `--strategy <name>`    | Bugreport round-1 dispatch strategy: `fanout` (default — every lens runs in round 1, identical to today's `--mode bugreport`) \| `waves` (a narrow set of triage-seeded GENERIC investigators dispatch in round 1; subsequent rounds use the existing role-aware dispatch). `waves` requires `--mode bugreport` and rejects with a clear error on any other mode. The resolved value is shown by `--dry-run` under `--mode bugreport`. Env fallback: `REPOLENS_STRATEGY`. Wave width is controlled by `REPOLENS_WAVE_WIDTH` (default `7`, clamped to `1..50`). |
 | `--local`              | Write local output files instead of creating remote issues. Most modes write markdown; polish mode writes JSON suggestion objects and grouped polishing shortlist drafts. No forge CLI required                                                                                                         |
 | `--output <path>`      | Output directory for local output files (requires `--local`, default: `logs/<run-id>/rounds/round-1/lens-outputs/`)                                                                                                                                                                                     |
@@ -793,7 +827,7 @@ The `<run-id>` must be a direct child of `logs/` and a genuine run dir (one carr
 
 ## Domains & Lenses (338 total across 34 domains)
 
-### Code Analysis Domains (used by `audit`, `feature`, `bugfix`, `custom`)
+### Code Analysis Domains (used by `audit`, `feature`, `bugfix`, `custom`, `branch-review`)
 
 | Domain                       | Lenses | Focus                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -951,6 +985,7 @@ This first slice emits the cleaned findings file only — it does not yet file t
 - **Polish Ranked Suggestions** — Polish runs write `logs/<run-id>/polish/ranked-suggestions.json`, sorted by deterministic polish rank with `fluency_baseline`, `soul_fit`, `effort_gap_multiplier`, and `polish_rank_x1000` on each suggestion
 - **Round Artifacts** — Every run creates `logs/<run-id>/rounds/round-N/` for each resolved round, including `metadata.json`, `lens-outputs/`, and `digest.md`. `round-N/.completed` appears only after that round finishes cleanly. Multi-round runs write between-round `dispatch.md` handoff files on completed rounds before the final round
 - **Specification Bundle Artifacts** — Runs using `--spec-dir` write `logs/<run-id>/spec-files.json` and `combined-spec.md`; `spec-change` also writes `combined-spec.base.md` and `spec-diff.txt`. The manifest records the effective filters, entry, deterministic file order, source byte counts, and combined size
+- **Branch Review Artifacts** — `branch-review` runs write the complete branch patch to `logs/<run-id>/branch-diff.txt` and a manifest to `logs/<run-id>/branch-manifest.md` recording the base ref, the base, head, and merge-base commits, the changed-file count and name-status list, and the diffstat. An empty delta writes both files empty. Resume reads the base ref and commits back from the manifest
 - **Final Artifacts** — Every run creates `logs/<run-id>/final/` and `logs/<run-id>/final/filed/`. Successful multi-round runs promote a schema-validated `logs/<run-id>/final/manifest.json`; later filing stages record filed issue links under `final/filed/`
 - **Logs** — `logs/<run-id>/<domain>/<lens>/iteration-N-TIMESTAMP.txt`. After a lens finishes, all but the most recent `REPOLENS_ITERATION_KEEP` (default `3`) of these forensic captures are gzipped to `.txt.gz`. Prune whole run directories with `./repolens.sh clean`
 - **Heartbeats** — Active lenses write `logs/<run-id>/.heartbeat/<domain>__<lens-id>.json`; files are removed after clean lens completion and left behind if a worker exits abnormally

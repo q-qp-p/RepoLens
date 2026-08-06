@@ -154,7 +154,7 @@ Commands:
                           hidden from status auto-select, eligible for clean
 
 Options:
-  --mode <mode>           audit (default) | feature | bugfix | bugreport | discover | deploy | custom | opensource | content | greenfield | polish | spec-change
+  --mode <mode>           audit (default) | feature | bugfix | bugreport | discover | deploy | custom | opensource | content | greenfield | polish | spec-change | branch-review
   --change <statement>    Change impact analysis — propagates statement across all lenses (implies --mode custom)
   --bug-report <file|text>
                           Symptom report for --mode bugreport. Accepts a file path (read verbatim)
@@ -208,6 +208,16 @@ Options:
                           --mode spec-change (default: HEAD — working-tree-vs-HEAD,
                           i.e. the uncommitted edit). Accepts a ref (HEAD~1) or a
                           range (HEAD~1..HEAD). Only valid with --mode spec-change.
+  --branch-base <ref>     Base ref the review head is compared against in
+                          --mode branch-review (required there, rejected
+                          elsewhere). The delta is three-dot: everything the
+                          head added on top of the merge base it shares with
+                          this ref, so commits that exist only on the base are
+                          never reported as branch changes.
+  --branch-head <ref>     Review head for --mode branch-review (default: HEAD).
+                          Must resolve to the checked-out commit — lenses read
+                          the working tree, so a head that is not checked out
+                          would be reviewed against files that are not there.
   --max-issues <n>        Stop after creating n total issues (dry-run quality check)
   --min-severity <level>  Only file findings at or above level: critical|high|medium|low
   --depth <n>             DONE streak depth per lens. Defaults: 3 for audit/feature/bugfix,
@@ -475,18 +485,19 @@ EOF
 
   echo ""
   echo "Modes:"
-  echo "  audit       (default) Code audit — finds issues in existing code"
-  echo "  feature     Feature analysis — discovers missing features and improvements"
-  echo "  bugfix      Bug hunting — finds potential bugs and defects"
-  echo "  discover    Product discovery — brainstorming for product strategy"
-  echo "  deploy      Server audit — inspects live server for operational issues"
-  echo "  custom      Change impact — analyzes what needs adapting (requires --change)"
-  echo "  opensource  Open source readiness — audits if a repo can go public safely"
-  echo "  content     Content audit & creation — audits existing content, creates from --source"
-  echo "  greenfield  Spec-to-backlog planning — creates one implementation issue per iteration (requires --spec)"
-  echo "  polish      Polish — proposes small, additive craft refinements"
-  echo "  bugreport   Symptom-driven investigation — runs lenses on a user bug report (requires --bug-report)"
-  echo "  spec-change Spec-diff impact — derives code changes from a tracked spec's git diff (requires --spec)"
+  echo "  audit         (default) Code audit — finds issues in existing code"
+  echo "  feature       Feature analysis — discovers missing features and improvements"
+  echo "  bugfix        Bug hunting — finds potential bugs and defects"
+  echo "  discover      Product discovery — brainstorming for product strategy"
+  echo "  deploy        Server audit — inspects live server for operational issues"
+  echo "  custom        Change impact — analyzes what needs adapting (requires --change)"
+  echo "  opensource    Open source readiness — audits if a repo can go public safely"
+  echo "  content       Content audit & creation — audits existing content, creates from --source"
+  echo "  greenfield    Spec-to-backlog planning — creates one implementation issue per iteration (requires --spec)"
+  echo "  polish        Polish — proposes small, additive craft refinements"
+  echo "  bugreport     Symptom-driven investigation — runs lenses on a user bug report (requires --bug-report)"
+  echo "  spec-change   Spec-diff impact — derives code changes from a tracked spec's git diff (requires --spec)"
+  echo "  branch-review Regression review — finds only defects a branch introduced vs a base ref (requires --branch-base)"
 
   # Parse all domains in one jq call
   local domain_data
@@ -619,6 +630,13 @@ declare -a SPEC_EXCLUDES=()
 SPEC_EXCLUDES_SET=false
 SPEC_BASE="HEAD"
 SPEC_BASE_SET=false
+BRANCH_BASE=""
+BRANCH_BASE_SET=false
+BRANCH_HEAD="HEAD"
+BRANCH_HEAD_SET=false
+BRANCH_BASE_SHA=""
+BRANCH_HEAD_SHA=""
+BRANCH_MERGE_BASE=""
 SPEC_TRUSTED_MANIFEST_SHA256=""
 MAX_ISSUES=""
 MIN_SEVERITY=""
@@ -796,6 +814,18 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "Option --spec-base requires a git ref/range argument."
       SPEC_BASE="$2"
       SPEC_BASE_SET=true
+      shift 2
+      ;;
+    --branch-base)
+      [[ $# -ge 2 ]] || die "Option --branch-base requires a git ref argument."
+      BRANCH_BASE="$2"
+      BRANCH_BASE_SET=true
+      shift 2
+      ;;
+    --branch-head)
+      [[ $# -ge 2 ]] || die "Option --branch-head requires a git ref argument."
+      BRANCH_HEAD="$2"
+      BRANCH_HEAD_SET=true
       shift 2
       ;;
     --max-issues)
@@ -1196,8 +1226,8 @@ fi
 
 # --- Validate mode ---
 case "$MODE" in
-  audit|feature|bugfix|bugreport|discover|deploy|custom|opensource|content|greenfield|polish|spec-change) ;;
-  *) die "Invalid mode: $MODE (expected 'audit', 'feature', 'bugfix', 'bugreport', 'discover', 'deploy', 'custom', 'opensource', 'content', 'greenfield', 'polish', or 'spec-change')" ;;
+  audit|feature|bugfix|bugreport|discover|deploy|custom|opensource|content|greenfield|polish|spec-change|branch-review) ;;
+  *) die "Invalid mode: $MODE (expected 'audit', 'feature', 'bugfix', 'bugreport', 'discover', 'deploy', 'custom', 'opensource', 'content', 'greenfield', 'polish', 'spec-change', or 'branch-review')" ;;
 esac
 
 # --- Resolve --strategy (CLI flag wins over REPOLENS_STRATEGY env) ---
@@ -1429,6 +1459,12 @@ if $DEPLOY_TARGET_SET && [[ "$MODE" != "deploy" ]]; then
 fi
 if $SPEC_BASE_SET && [[ "$MODE" != "spec-change" ]]; then
   die "--spec-base requires --mode spec-change"
+fi
+if $BRANCH_BASE_SET && [[ "$MODE" != "branch-review" ]]; then
+  die "--branch-base requires --mode branch-review"
+fi
+if $BRANCH_HEAD_SET && [[ "$MODE" != "branch-review" ]]; then
+  die "--branch-head requires --mode branch-review"
 fi
 if [[ -n "$SPEC_FILE" && -n "$SPEC_DIR" ]]; then
   die "--spec and --spec-dir are mutually exclusive"
@@ -1676,6 +1712,15 @@ fi
 # --- Validate spec-change spec requirement ---
 if [[ "$MODE" == "spec-change" && -z "$SPEC_FILE" && -z "$SPEC_DIR" ]]; then
   die "Mode 'spec-change' requires --spec <file> or --spec-dir <dir>"
+fi
+
+# --- Validate branch-review base requirement ---
+# The base ref is the whole premise of the mode: without it there is no delta
+# to review and nothing distinguishes the run from a plain audit. Resumed runs
+# rehydrate the base from the persisted branch manifest, so only fresh runs
+# demand the flag.
+if [[ "$MODE" == "branch-review" && -z "$BRANCH_BASE" && -z "$RESUME_RUN_ID" ]]; then
+  die "Mode 'branch-review' requires --branch-base <ref> (the branch or commit the review head is compared against)"
 fi
 
 # --- Handle remote repository URL ---
@@ -2590,6 +2635,109 @@ if [[ "$MODE" == "spec-change" ]]; then
   fi
 fi
 
+# --- Compute / rehydrate the branch delta for branch-review mode ---
+# branch-review derives its work from what the review head introduced on top of
+# the merge base it shares with --branch-base. The delta is THREE-DOT
+# (`git diff <merge-base> <head>`, i.e. `base...head`): a two-dot diff would
+# report commits that exist only on the base as deletions the branch made, and
+# every one of those would be filed as a phantom regression.
+#
+# The full patch is persisted verbatim to logs/<run-id>/branch-diff.txt so every
+# lens (and every --resume) sees the identical delta. A bounded manifest —
+# provenance SHAs, name-status, diffstat — goes to branch-manifest.md and is the
+# only thing transported into the prompt; agents pull per-file patches on demand
+# from the recorded SHAs, so a multi-MB branch never blows up 248 prompts.
+BRANCH_DIFF_FILE="$LOG_BASE/branch-diff.txt"
+BRANCH_MANIFEST_FILE="$LOG_BASE/branch-manifest.md"
+if [[ "$MODE" == "branch-review" ]]; then
+  if [[ -n "$RESUME_RUN_ID" ]]; then
+    # Reuse the delta captured at the original run start for reproducibility.
+    [[ -f "$BRANCH_DIFF_FILE" && ! -L "$BRANCH_DIFF_FILE" ]] \
+      || die "Resume of branch-review run $RUN_ID requires a regular non-symlink persisted branch-diff.txt artifact"
+    [[ -f "$BRANCH_MANIFEST_FILE" && ! -L "$BRANCH_MANIFEST_FILE" ]] \
+      || die "Resume of branch-review run $RUN_ID requires a regular non-symlink persisted branch-manifest.md artifact"
+    _branch_resume_base="$(sed -n 's/^- base ref: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
+    if $BRANCH_BASE_SET && [[ -n "$_branch_resume_base" && "$BRANCH_BASE" != "$_branch_resume_base" ]]; then
+      die "Resume --branch-base '$BRANCH_BASE' does not match persisted value '$_branch_resume_base'"
+    fi
+    [[ -n "$_branch_resume_base" ]] && BRANCH_BASE="$_branch_resume_base"
+    BRANCH_BASE_SHA="$(sed -n 's/^- base commit: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
+    BRANCH_HEAD_SHA="$(sed -n 's/^- head commit: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
+    BRANCH_MERGE_BASE="$(sed -n 's/^- merge base: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
+    unset _branch_resume_base
+  else
+    BRANCH_BASE_SHA="$(git -C "$PROJECT_PATH" rev-parse --verify --quiet "${BRANCH_BASE}^{commit}" 2>/dev/null)" \
+      || die "Mode 'branch-review' could not resolve --branch-base '$BRANCH_BASE' to a commit in $PROJECT_PATH — check that it is a valid git ref (fetch it first if it only exists on the remote)."
+    [[ -n "$BRANCH_BASE_SHA" ]] \
+      || die "Mode 'branch-review' could not resolve --branch-base '$BRANCH_BASE' to a commit in $PROJECT_PATH — check that it is a valid git ref (fetch it first if it only exists on the remote)."
+
+    BRANCH_HEAD_SHA="$(git -C "$PROJECT_PATH" rev-parse --verify --quiet "${BRANCH_HEAD}^{commit}" 2>/dev/null)" \
+      || die "Mode 'branch-review' could not resolve --branch-head '$BRANCH_HEAD' to a commit in $PROJECT_PATH — check that it is a valid git ref."
+    [[ -n "$BRANCH_HEAD_SHA" ]] \
+      || die "Mode 'branch-review' could not resolve --branch-head '$BRANCH_HEAD' to a commit in $PROJECT_PATH — check that it is a valid git ref."
+
+    # Lenses read the working tree, so reviewing a head that is not checked out
+    # would pair a diff from one commit with source from another. Fail loudly
+    # rather than silently reviewing the wrong files.
+    _branch_checked_out_sha="$(git -C "$PROJECT_PATH" rev-parse --verify --quiet HEAD 2>/dev/null)"
+    if [[ "$BRANCH_HEAD_SHA" != "$_branch_checked_out_sha" ]]; then
+      die "--branch-head '$BRANCH_HEAD' resolves to $BRANCH_HEAD_SHA, which is not the checked-out commit ($_branch_checked_out_sha). Lenses analyze the working tree, so check out the head you want to review or omit --branch-head."
+    fi
+    unset _branch_checked_out_sha
+
+    BRANCH_MERGE_BASE="$(git -C "$PROJECT_PATH" merge-base "$BRANCH_BASE_SHA" "$BRANCH_HEAD_SHA" 2>/dev/null)"
+    if [[ -z "$BRANCH_MERGE_BASE" ]]; then
+      _branch_shallow_hint=""
+      if [[ "$(git -C "$PROJECT_PATH" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+        _branch_shallow_hint=" This checkout is a shallow clone, so the shared ancestor may simply be missing — run 'git fetch --unshallow' (or set fetch-depth: 0 in CI) and retry."
+      fi
+      die "Mode 'branch-review' found no merge base between --branch-base '$BRANCH_BASE' ($BRANCH_BASE_SHA) and head $BRANCH_HEAD_SHA — the two refs have unrelated histories.${_branch_shallow_hint}"
+    fi
+    unset _branch_shallow_hint
+
+    if ! git -C "$PROJECT_PATH" diff --find-renames --no-ext-diff \
+      "$BRANCH_MERGE_BASE" "$BRANCH_HEAD_SHA" > "$BRANCH_DIFF_FILE" 2>/dev/null; then
+      die "Mode 'branch-review' could not compute the branch delta between $BRANCH_MERGE_BASE and $BRANCH_HEAD_SHA."
+    fi
+
+    _branch_name_status="$(git -C "$PROJECT_PATH" diff --find-renames --no-ext-diff --name-status \
+      "$BRANCH_MERGE_BASE" "$BRANCH_HEAD_SHA" 2>/dev/null)"
+    _branch_diffstat="$(git -C "$PROJECT_PATH" diff --find-renames --no-ext-diff --stat \
+      "$BRANCH_MERGE_BASE" "$BRANCH_HEAD_SHA" 2>/dev/null)"
+    _branch_file_count=0
+    [[ -n "$_branch_name_status" ]] && _branch_file_count="$(printf '%s\n' "$_branch_name_status" | wc -l | tr -d ' ')"
+
+    if [[ "$_branch_file_count" -eq 0 ]]; then
+      # An empty delta is valid: the manifest stays empty so the prompt renders
+      # the explicit "no changes" notice and every lens terminates immediately.
+      : > "$BRANCH_MANIFEST_FILE" || die "Unable to persist branch manifest to $BRANCH_MANIFEST_FILE"
+    else
+      {
+        printf '# Branch Review Manifest\n\n'
+        printf -- '- base ref: %s\n' "$BRANCH_BASE"
+        printf -- '- base commit: %s\n' "$BRANCH_BASE_SHA"
+        printf -- '- head ref: %s\n' "$BRANCH_HEAD"
+        printf -- '- head commit: %s\n' "$BRANCH_HEAD_SHA"
+        printf -- '- merge base: %s\n' "$BRANCH_MERGE_BASE"
+        printf -- '- changed files: %s\n' "$_branch_file_count"
+        printf -- '- full patch artifact: %s\n' "$BRANCH_DIFF_FILE"
+        printf '\n## Changed Files (name-status vs merge base)\n\n'
+        printf '%s\n' "$_branch_name_status"
+        printf '\n## Diffstat\n\n'
+        printf '%s\n' "$_branch_diffstat"
+      } > "$BRANCH_MANIFEST_FILE" || die "Unable to persist branch manifest to $BRANCH_MANIFEST_FILE"
+    fi
+
+    # A dirty tree is not fatal — lenses read the working tree by design — but
+    # the delta was computed from committed state, so say so out loud.
+    if [[ -n "$(git -C "$PROJECT_PATH" status --porcelain 2>/dev/null)" ]]; then
+      log_warn "Working tree at $PROJECT_PATH has uncommitted changes; the branch delta covers committed state only"
+    fi
+
+    unset _branch_name_status _branch_diffstat _branch_file_count
+  fi
+fi
+
 # Path to the round-0 triage context pack. Populated by run_triage when
 # --no-triage is off in bugreport mode; substituted into round-1 lens prompts
 # via the {{TRIAGE_CONTEXT_PACK}} slot. When the file is absent (other modes,
@@ -2830,6 +2978,10 @@ run_remote_preflight() {
 [[ "$MODE" == "greenfield" ]] && log_info "Greenfield mode: spec-to-backlog planning (DONE streak: 1)"
 [[ "$MODE" == "polish" ]] && log_info "Polish mode: single-pass polishing (DONE streak: 1)"
 [[ "$MODE" == "spec-change" ]] && log_info "Spec-change mode: spec-diff impact analysis vs base '$SPEC_BASE' (DONE streak: 1)"
+if [[ "$MODE" == "branch-review" ]]; then
+  log_info "Branch-review mode: regression review of $BRANCH_HEAD_SHA vs base '$BRANCH_BASE' ($BRANCH_BASE_SHA), merge base $BRANCH_MERGE_BASE (DONE streak: 1)"
+  log_info "Branch delta artifacts: $BRANCH_DIFF_FILE, $BRANCH_MANIFEST_FILE"
+fi
 POLISH_SURFACE=""
 if [[ "$MODE" == "polish" ]]; then
   POLISH_SURFACE="$(detect_polish_surface "$PROJECT_PATH")"
@@ -3975,6 +4127,13 @@ if $DRY_RUN; then
       fi
     done
   fi
+  if [[ "$MODE" == "branch-review" ]]; then
+    echo "Branch base:  $BRANCH_BASE ($BRANCH_BASE_SHA)"
+    echo "Branch head:  $BRANCH_HEAD ($BRANCH_HEAD_SHA)"
+    echo "Merge base:   $BRANCH_MERGE_BASE"
+    echo "Branch diff:  $BRANCH_DIFF_FILE"
+    echo "Branch manifest: $BRANCH_MANIFEST_FILE"
+  fi
   echo "Rounds:      $ROUNDS"
   if [[ "$MODE" == "bugreport" ]]; then
     echo "Strategy:     $STRATEGY"
@@ -4081,6 +4240,7 @@ ensure_labels() {
     greenfield)  label_prefix="greenfield" ;;
     polish)      label_prefix="polish" ;;
     spec-change) label_prefix="change" ;;
+    branch-review) label_prefix="regression" ;;
   esac
 
   local label_set_file
@@ -4265,6 +4425,7 @@ run_lens() {
     greenfield)  label_prefix="greenfield" ;;
     polish)      label_prefix="polish" ;;
     spec-change) label_prefix="change" ;;
+    branch-review) label_prefix="regression" ;;
   esac
   lens_label="${label_prefix}:${domain}/${lens_id}"
 
@@ -4311,6 +4472,9 @@ run_lens() {
   [[ -n "$CHANGE_STATEMENT" ]] && vars+="|CHANGE_STATEMENT=${CHANGE_STATEMENT}"
   if [[ "$MODE" == "spec-change" && -f "$SPEC_DIFF_FILE" ]]; then
     vars+="|SPEC_DIFF=@${SPEC_DIFF_FILE}"
+  fi
+  if [[ "$MODE" == "branch-review" && -f "$BRANCH_MANIFEST_FILE" ]]; then
+    vars+="|BRANCH_DIFF_SUMMARY=@${BRANCH_MANIFEST_FILE}"
   fi
   if [[ "$MODE" == "bugreport" && -f "$BUG_REPORT_FILE" ]]; then
     vars+="|BUG_REPORT=@${BUG_REPORT_FILE}"

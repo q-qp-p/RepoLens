@@ -8,7 +8,7 @@
 
 RepoLens implements **Lens-Based Auditing (LBA)**, a methodology for automated code analysis that decomposes the audit problem into 338 narrow-focus specialist agents ("lenses") across 34 domains. Rather than asking a single generalist agent to review an entire codebase for every possible concern, LBA assigns each concern to a dedicated expert lens — one that examines the code through a single, specific perspective.
 
-The tool currently supports 12 modes of operation (audit, feature, bugfix, bugreport, discover, deploy, opensource, content, greenfield, custom, polish, spec-change), multiple agent backends, parallel execution, automated issue creation, and ranked polishing shortlists. This document describes the methodology behind the tool: what Lensing is, why it works, and how its components fit together.
+The tool currently supports 13 modes of operation (audit, feature, bugfix, bugreport, discover, deploy, opensource, content, greenfield, custom, polish, spec-change, branch-review), multiple agent backends, parallel execution, automated issue creation, and ranked polishing shortlists. This document describes the methodology behind the tool: what Lensing is, why it works, and how its components fit together.
 
 ---
 
@@ -134,7 +134,7 @@ Within one lens, two safety bounds cap the worst case: a hard ceiling of 20 iter
 
 ## Mode Isolation
 
-RepoLens supports 12 modes of operation. Mode isolation ensures that each mode sees only the domains and lenses relevant to its purpose, preventing cross-contamination between fundamentally different audit strategies.
+RepoLens supports 13 modes of operation. Mode isolation ensures that each mode sees only the domains and lenses relevant to its purpose, preventing cross-contamination between fundamentally different audit strategies.
 
 Mode isolation is implemented through three mechanisms:
 
@@ -142,7 +142,7 @@ Mode isolation is implemented through three mechanisms:
 2. **Base prompt selection** — Each mode has a dedicated base template that shapes agent behavior
 3. **Behavioral parameters** — DONE streak threshold, label prefix, issue severity schema, and confirmation gates vary per mode
 
-**The 12 modes:**
+**The 13 modes:**
 
 The `--depth default` and `--rounds default` columns reflect the CLI defaults as of this revision. `--depth` controls within-lens iteration; `--rounds` controls across-lens cross-pollination via the meta-orchestrator (see next section). Modes marked "1 (locked)" cap `--rounds` at 1 by design — single-pass operation is intrinsic to those modes.
 
@@ -160,6 +160,7 @@ The `--depth default` and `--rounds default` columns reflect the CLI defaults as
 | **greenfield** | Spec-to-backlog planning for a new or skeletal project. Requires `--spec <file>` or `--spec-dir <dir>`, checks the current open issue or local draft backlog, and creates non-duplicate implementation-sized `[P0]`-`[P3]` issues without inspecting repository code | 1 (greenfield planning only) | 1 | 1 (locked) |
 | **polish** | Ranked polishing shortlists for small, additive craft refinements with voice-fit evidence | 16 (`fluency`, `effort-signal`, and `hedonic` polish domains; `fluency` is visual-UI only) | 1 | 1 (locked) |
 | **spec-change** | Spec-diff impact analysis. Requires a tracked `--spec <file>` or an in-repository `--spec-dir <dir>`, diffs it against `--spec-base` (default `HEAD`), and files one impact-prefixed (`[BREAKING]`/`[REQUIRED]`/`[RECOMMENDED]`/`[OPTIONAL]`) issue per code change the diff implies | 1 (spec-change planning only) | 1 | 1 (locked) |
+| **branch-review** | Branch regression review. Requires `--branch-base <ref>` (optional `--branch-head`, default `HEAD`), diffs the checked-out head against the merge base it shares with the base ref (three-dot semantics, so base-only commits are never reported as branch changes), and files one `[REGRESSION]`-prefixed issue per defect the branch introduced. Defects that already exist at the merge base are out of scope | 248 (code + toolgate + logs domains) | 1 | 1 (locked) |
 
 Each mode uses its own output schema (e.g., audit uses CRITICAL/HIGH/MEDIUM/LOW, discover uses SMALL/MEDIUM/LARGE/XL, custom uses BREAKING/REQUIRED/RECOMMENDED/OPTIONAL, and greenfield uses P0/P1/P2/P3) and its own label format when labels apply.
 
