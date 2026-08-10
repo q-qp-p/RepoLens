@@ -2664,6 +2664,13 @@ if [[ "$MODE" == "branch-review" ]]; then
     BRANCH_BASE_SHA="$(sed -n 's/^- base commit: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
     BRANCH_HEAD_SHA="$(sed -n 's/^- head commit: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
     BRANCH_MERGE_BASE="$(sed -n 's/^- merge base: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
+    if [[ -n "$BRANCH_HEAD_SHA" ]]; then
+      _branch_checked_out_sha="$(git -C "$PROJECT_PATH" rev-parse --verify --quiet HEAD 2>/dev/null)"
+      if [[ "$BRANCH_HEAD_SHA" != "$_branch_checked_out_sha" ]]; then
+        die "Resume of branch-review run $RUN_ID has persisted review head $BRANCH_HEAD_SHA, which is not the checked-out commit ($_branch_checked_out_sha). Lenses analyze the working tree, so check out the persisted review head or start a new run."
+      fi
+      unset _branch_checked_out_sha
+    fi
     unset _branch_resume_base
   else
     BRANCH_BASE_SHA="$(git -C "$PROJECT_PATH" rev-parse --verify --quiet "${BRANCH_BASE}^{commit}" 2>/dev/null)" \

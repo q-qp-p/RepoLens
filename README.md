@@ -498,7 +498,7 @@ The complete patch is written once to `logs/<run-id>/branch-diff.txt`, and a bou
 
 An empty delta is a successful run, not an error: the lenses see an explicit "no changes" notice, file nothing, and the run exits `0`. These conditions stop the run before any agent is dispatched, each naming the offending ref: a base or head ref that does not resolve locally, a base ref with no shared history (with a `git fetch --unshallow` hint when the checkout is shallow), and a `--branch-head` that is not the checked-out commit. An uncommitted working tree is only a warning — the delta covers committed state.
 
-Resuming a branch review rehydrates the base ref and the three commits from the persisted manifest instead of recomputing them, so a resumed run reviews the identical delta even if the branch moved on. `--branch-base` is therefore optional on resume; passing one that disagrees with the persisted value stops the run.
+Resuming a branch review rehydrates the base ref and the three commits from the persisted manifest instead of recomputing them, so the delta stays pinned to the run's original review head. A non-empty resume proceeds only when that persisted head is still checked out; otherwise RepoLens stops before dispatching agents. Check out the persisted head recorded in `logs/<run-id>/branch-manifest.md` to continue the frozen run, or start a new branch review at the current head. `--branch-base` is therefore optional on resume; passing one that disagrees with the persisted value stops the run.
 
 ## Remote deploy mode
 

@@ -34,6 +34,8 @@
 #   7. The mode sees the full code lens fleet (same set as audit) and keeps
 #      --min-severity active — regressions are severity-bearing.
 #   8. lib/core.sh mode tables and the prompts/_base wrapper cover the mode.
+#   9. Resume rejects a persisted, non-empty review head when that commit is no
+#      longer checked out, while a resume at the matching head still succeeds.
 #
 # No real models are invoked — every CLI case uses --dry-run and a fake agent.
 
@@ -452,10 +454,10 @@ fi
 # ---------------------------------------------------------------------------
 # Part D — provenance reporting, non-fatal states, and --resume rehydration
 #
-# The resume path re-reads the delta from the persisted manifest instead of
-# recomputing it, so a resumed run must review the SAME commits even after the
-# repository has moved on. These tests mutate the fixture history, so they run
-# last.
+# The resume path re-reads the frozen delta from the persisted manifest instead
+# of recomputing it. Because lenses inspect the working tree, that delta is safe
+# to resume only while its persisted review head is checked out. These tests
+# mutate the fixture history, so they run last.
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -514,31 +516,47 @@ if [[ -f "$DIRTY_DIFF_ARTIFACT" ]]; then
 fi
 
 echo ""
-echo "Test 22: --resume rehydrates the pinned delta instead of recomputing it"
+echo "Test 22: --resume rejects a pinned review head that is not checked out"
 run_repolens "resume-seed" --mode branch-review --branch-base trunk --local --yes --dry-run --output "$TMPDIR/resume-issues"
-resume_run_id="$LAST_RUN_ID"
+pinned_resume_run_id="$LAST_RUN_ID"
 assert_eq "resume seed run exits successfully" "0" "$(cat "$TMPDIR/resume-seed.rc")"
-# Move the repository on AFTER the seed run: a resumed run that recomputed the
-# delta would pick up this commit and review a different head than the one it
-# was started against.
+# Move the repository on AFTER the seed run. Its persisted delta remains pinned
+# to HEAD_SHA, but lenses would now inspect files from POST_RESUME_SHA. Resume
+# must reject that pairing rather than emit findings with wrong line anchors.
 printf 'introduced after the run started\n' > "$PROJECT_DIR/post-resume.txt"
 git_fixture add post-resume.txt
 git_fixture commit -q -m 'c5 committed after the seed run'
 POST_RESUME_SHA="$(git -C "$PROJECT_DIR" rev-parse HEAD)"
-run_repolens "resume-basic" --mode branch-review --resume "$resume_run_id" \
+run_repolens "resume-stale-head" --mode branch-review --resume "$pinned_resume_run_id" \
   --local --yes --dry-run --output "$TMPDIR/resume-issues"
-resume_out="$(cat "$TMPDIR/resume-basic.out")"
-assert_eq "resume without --branch-base exits successfully" "0" "$(cat "$TMPDIR/resume-basic.rc")"
-assert_not_contains "resume does not demand --branch-base again" "requires --branch-base" "$resume_out"
-assert_contains "resume rehydrates the base ref from the manifest" "trunk ($TRUNK_SHA)" "$resume_out"
-assert_contains "resume reviews the head the run was started against" "HEAD ($HEAD_SHA)" "$resume_out"
-assert_not_contains "resume does not re-resolve HEAD to the newer commit" "$POST_RESUME_SHA" "$resume_out"
-assert_contains "resume rehydrates the merge base from the manifest" "$C1_SHA" "$resume_out"
-RESUME_DIFF_ARTIFACT="$SCRIPT_DIR/logs/$resume_run_id/branch-diff.txt"
+stale_resume_out="$(cat "$TMPDIR/resume-stale-head.out")"
+assert_eq "resume with a different checked-out HEAD exits non-zero" "1" \
+  "$(cat "$TMPDIR/resume-stale-head.rc")"
+assert_contains "mismatched resume identifies the persisted review head" \
+  "$HEAD_SHA" "$stale_resume_out"
+assert_contains "mismatched resume identifies the checked-out HEAD" \
+  "$POST_RESUME_SHA" "$stale_resume_out"
+assert_contains "mismatched resume explains the checked-out commit invariant" \
+  "checked-out commit" "$stale_resume_out"
+assert_contains "mismatched resume explains that lenses inspect the working tree" \
+  "working tree" "$stale_resume_out"
+RESUME_DIFF_ARTIFACT="$SCRIPT_DIR/logs/$pinned_resume_run_id/branch-diff.txt"
 if [[ -f "$RESUME_DIFF_ARTIFACT" ]]; then
   assert_not_contains "the pinned patch does not absorb post-start commits" \
     "post-resume.txt" "$(cat "$RESUME_DIFF_ARTIFACT")"
 fi
+
+# The invariant is identity, not a blanket ban on branch-review resumes. Seed a
+# run at the now-current head for the positive resume and artifact checks below.
+run_repolens "resume-current-seed" --mode branch-review --branch-base trunk \
+  --local --yes --dry-run --output "$TMPDIR/resume-issues"
+resume_run_id="$LAST_RUN_ID"
+assert_eq "current-head resume seed exits successfully" "0" \
+  "$(cat "$TMPDIR/resume-current-seed.rc")"
+run_repolens "resume-current" --mode branch-review --resume "$resume_run_id" \
+  --local --yes --dry-run --output "$TMPDIR/resume-issues"
+assert_eq "resume with the persisted head checked out still succeeds" "0" \
+  "$(cat "$TMPDIR/resume-current.rc")"
 
 echo ""
 echo "Test 23: --resume rejects a --branch-base that disagrees with the persisted value"
