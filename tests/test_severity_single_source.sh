@@ -135,6 +135,10 @@ assert_eq "no argument is safe and empty under set -u" "" "$(severity_from_title
 # back-door data source.
 assert_eq "trailing bracket severity is not a prefix" "" "$(severity_from_title "SQL injection [HIGH]")"
 assert_eq "leading whitespace before the bracket is not a prefix" "" "$(severity_from_title "  [HIGH] x")"
+# Branch-review titles carry one canonical mode marker before their severity.
+# That marker is not itself a severity and must not hide the following prefix.
+assert_eq "branch-review marker exposes its following severity" "low" \
+  "$(severity_from_title "[REGRESSION][LOW] x")"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -147,6 +151,14 @@ echo "=== detect_severity_mismatch: frontmatter wins; title prefix is advisory =
 
 out="$(detect_severity_mismatch "high" "[LOW] foo")"; rc=$?
 assert_out_rc "disagreeing title flags mismatch, returns frontmatter value" "high" "1" "$out" "$rc"
+
+out="$(detect_severity_mismatch "high" "[REGRESSION][LOW] x")"; rc=$?
+assert_out_rc "branch-review disagreement flags mismatch, returns frontmatter value" \
+  "high" "1" "$out" "$rc"
+
+out="$(detect_severity_mismatch "high" "[REGRESSION][HIGH] x")"; rc=$?
+assert_out_rc "branch-review agreement is silent and returns frontmatter value" \
+  "high" "0" "$out" "$rc"
 
 out="$(detect_severity_mismatch "high" "[HIGH] foo")"; rc=$?
 assert_out_rc "agreeing title is no mismatch, returns frontmatter value" "high" "0" "$out" "$rc"
@@ -240,14 +252,14 @@ scenario_observed() {
 setup_scenario mismatch-warns
 cat > "$SCEN_OUTPUT/001-titled-low-but-high.md" <<'MD'
 ---
-title: "[LOW] Frontmatter is authoritative"
+title: "[REGRESSION][LOW] Frontmatter is authoritative"
 severity: high
 domain: security
 lens: injection
 ---
 
 ## Summary
-The title prefix says LOW but the frontmatter says high.
+The branch-review title prefix says LOW but the frontmatter says high.
 MD
 export REPOLENS_MIN_SEVERITY=low
 count="$(count_dry_run_issues "$SCEN_OUTPUT" 2>"$SCEN_STDERR")"

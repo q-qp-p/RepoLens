@@ -206,7 +206,8 @@ finding_resolve_type() {
 
 # severity_from_title <title>
 #   Extracts a normalized severity from a leading "[SEVERITY]" title prefix,
-#   reusing the strict prefix regex from _synthesize_normalize_title
+#   skipping the canonical leading "[REGRESSION]" branch-review marker when
+#   present. Reuses the strict prefix regex from _synthesize_normalize_title
 #   (^\[([A-Za-z]+)\][[:space:]]*(.*)$). This is ADVISORY / display-only and must
 #   NEVER be used as a data source — frontmatter `severity:` is the single source
 #   of truth (issue #331). Prints the canonical severity (via severity_normalize)
@@ -214,6 +215,9 @@ finding_resolve_type() {
 #   is no prefix or the bracketed word is not a severity. Pure; set -u safe.
 severity_from_title() {
   local title="${1:-}"
+  if [[ "$title" =~ ^\[REGRESSION\](.*)$ ]]; then
+    title="${BASH_REMATCH[1]}"
+  fi
   if [[ "$title" =~ ^\[([A-Za-z]+)\][[:space:]]*(.*)$ ]]; then
     severity_normalize "${BASH_REMATCH[1]}"
     return 0
