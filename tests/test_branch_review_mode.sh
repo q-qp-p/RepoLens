@@ -36,6 +36,8 @@
 #   8. lib/core.sh mode tables and the prompts/_base wrapper cover the mode.
 #   9. Resume rejects a persisted, non-empty review head when that commit is no
 #      longer checked out, while a resume at the matching head still succeeds.
+#  10. Resume restores the persisted head ref for provenance, accepts the same
+#      explicit --branch-head, and rejects a conflicting explicit head ref.
 #
 # No real models are invoked — every CLI case uses --dry-run and a fake agent.
 
@@ -547,16 +549,28 @@ if [[ -f "$RESUME_DIFF_ARTIFACT" ]]; then
 fi
 
 # The invariant is identity, not a blanket ban on branch-review resumes. Seed a
-# run at the now-current head for the positive resume and artifact checks below.
+# run at the now-current head under a non-default ref spelling so the positive
+# resume also proves that persisted head provenance is restored.
+RESUME_HEAD_REF="review-head"
+git -C "$PROJECT_DIR" branch "$RESUME_HEAD_REF" "$POST_RESUME_SHA"
 run_repolens "resume-current-seed" --mode branch-review --branch-base trunk \
+  --branch-head "$RESUME_HEAD_REF" \
   --local --yes --dry-run --output "$TMPDIR/resume-issues"
 resume_run_id="$LAST_RUN_ID"
 assert_eq "current-head resume seed exits successfully" "0" \
   "$(cat "$TMPDIR/resume-current-seed.rc")"
+RESUME_MANIFEST_ARTIFACT="$SCRIPT_DIR/logs/$resume_run_id/branch-manifest.md"
+if [[ -f "$RESUME_MANIFEST_ARTIFACT" ]]; then
+  assert_contains "resume seed manifest records the explicit head ref" \
+    "- head ref: $RESUME_HEAD_REF" "$(cat "$RESUME_MANIFEST_ARTIFACT")"
+fi
 run_repolens "resume-current" --mode branch-review --resume "$resume_run_id" \
   --local --yes --dry-run --output "$TMPDIR/resume-issues"
+resume_current_out="$(cat "$TMPDIR/resume-current.out")"
 assert_eq "resume with the persisted head checked out still succeeds" "0" \
   "$(cat "$TMPDIR/resume-current.rc")"
+assert_contains "resume without --branch-head reports the persisted head ref" \
+  "Branch head:  $RESUME_HEAD_REF ($POST_RESUME_SHA)" "$resume_current_out"
 
 echo ""
 echo "Test 23: --resume rejects a --branch-base that disagrees with the persisted value"
@@ -574,7 +588,29 @@ run_repolens "resume-match" --mode branch-review --branch-base trunk --resume "$
 assert_eq "resume with the matching --branch-base still succeeds" "0" "$(cat "$TMPDIR/resume-match.rc")"
 
 echo ""
-echo "Test 24: --resume requires regular, non-symlink persisted artifacts"
+echo "Test 24: --resume accepts the persisted --branch-head and rejects head-ref drift"
+run_repolens "resume-head-match" --mode branch-review --branch-head "$RESUME_HEAD_REF" \
+  --resume "$resume_run_id" --local --yes --dry-run --output "$TMPDIR/resume-issues"
+assert_eq "resume with the matching --branch-head still succeeds" "0" \
+  "$(cat "$TMPDIR/resume-head-match.rc")"
+
+# HEAD names the same checked-out commit as review-head. The conflict is still
+# observable provenance drift: an explicitly supplied resume ref must match the
+# spelling frozen in the manifest, just as --branch-base must.
+run_repolens "resume-head-mismatch" --mode branch-review --branch-head HEAD \
+  --resume "$resume_run_id" --local --yes --dry-run --output "$TMPDIR/resume-issues"
+head_mismatch_resume_out="$(cat "$TMPDIR/resume-head-mismatch.out")"
+assert_eq "conflicting resume --branch-head exits non-zero" "1" \
+  "$(cat "$TMPDIR/resume-head-mismatch.rc")"
+assert_contains "conflicting resume --branch-head reports the mismatch" \
+  "does not match persisted value" "$head_mismatch_resume_out"
+assert_contains "conflicting resume --branch-head quotes the supplied ref" \
+  "HEAD" "$head_mismatch_resume_out"
+assert_contains "conflicting resume --branch-head quotes the persisted ref" \
+  "$RESUME_HEAD_REF" "$head_mismatch_resume_out"
+
+echo ""
+echo "Test 25: --resume requires regular, non-symlink persisted artifacts"
 PINNED_DIFF="$SCRIPT_DIR/logs/$resume_run_id/branch-diff.txt"
 PINNED_MANIFEST="$SCRIPT_DIR/logs/$resume_run_id/branch-manifest.md"
 if [[ -f "$PINNED_DIFF" && -f "$PINNED_MANIFEST" ]]; then
@@ -611,7 +647,7 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "Test 25: the wrapper encodes the regression issue contract"
+echo "Test 26: the wrapper encodes the regression issue contract"
 result="$(compose_prompt "$BASE_WRAPPER" "$TMPDIR/lens.md" \
   "LENS_NAME=TestBot|MIN_SEVERITY=high|BRANCH_DIFF_SUMMARY=@$TMPDIR/manifest-basic.md" \
   "" "branch-review" 2>/dev/null)"
@@ -628,7 +664,7 @@ assert_contains "--min-severity renders a threshold section" "## Minimum Severit
 assert_contains "--min-severity threshold reaches the lens" "**high** or higher" "$result"
 
 echo ""
-echo "Test 26: a fully-parameterized branch-review prompt leaves no unresolved placeholder"
+echo "Test 27: a fully-parameterized branch-review prompt leaves no unresolved placeholder"
 # Every {{TOKEN}} the wrapper declares gets a value, except the ones
 # compose_prompt builds itself (*_SECTION) and the lens body. Anything still
 # rendered as {{...}} is a placeholder nothing substitutes.
@@ -651,7 +687,7 @@ assert_contains "the lens body is spliced into the wrapper" \
   "Find injection defects introduced by the branch." "$result"
 
 echo ""
-echo "Test 27: the mode files issues under the regression label prefix"
+echo "Test 28: the mode files issues under the regression label prefix"
 # Both label call sites (ensure_labels bootstrap and run_lens dispatch) must map
 # branch-review to the same prefix, or lenses would create issues under a label
 # the run never provisioned.
@@ -685,7 +721,7 @@ run_repolens_project() {
 }
 
 echo ""
-echo "Test 28: an explicit --branch-head resolving to the checked-out commit is accepted"
+echo "Test 29: an explicit --branch-head resolving to the checked-out commit is accepted"
 # Test 11 pins the rejection. This is its other half: the guard compares
 # RESOLVED COMMITS, not ref spellings, so naming the checked-out commit by raw
 # SHA — a string that is never literally "HEAD" — has to be accepted. An
@@ -702,7 +738,7 @@ assert_contains "explicit --branch-head is reported as the review head" \
   "Branch head:  $CURRENT_HEAD_SHA ($CURRENT_HEAD_SHA)" "$head_explicit_out"
 
 echo ""
-echo "Test 29: renames stay renames even when the repository disables rename detection"
+echo "Test 30: renames stay renames even when the repository disables rename detection"
 # The delta is computed with an explicit --find-renames. Without it, a repo (or
 # a user's global gitconfig) carrying diff.renames=false turns every rename into
 # a delete plus an add, and lenses would file the deletion as a phantom "the
@@ -729,7 +765,7 @@ if [[ -f "$RENAME_MANIFEST" ]]; then
 fi
 
 echo ""
-echo "Test 30: resuming an empty-delta run rehydrates cleanly from the empty manifest"
+echo "Test 31: resuming an empty-delta run rehydrates cleanly from the empty manifest"
 # The zero-byte manifest a no-op run persists carries no '- base ref:' line, so
 # the resume path walks every rehydration branch with an empty value. It must
 # still start — the --branch-base requirement is waived on resume — rather than
@@ -751,7 +787,7 @@ else
 fi
 
 echo ""
-echo "Test 31: a shallow checkout with no reachable merge base gets the unshallow remedy"
+echo "Test 32: a shallow checkout with no reachable merge base gets the unshallow remedy"
 # The CI shape of this feature: actions/checkout clones at fetch-depth 1, so the
 # shared ancestor is simply absent from the object store and merge-base comes up
 # empty even though the two refs are genuinely related. Generic "unrelated

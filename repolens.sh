@@ -2661,6 +2661,11 @@ if [[ "$MODE" == "branch-review" ]]; then
       die "Resume --branch-base '$BRANCH_BASE' does not match persisted value '$_branch_resume_base'"
     fi
     [[ -n "$_branch_resume_base" ]] && BRANCH_BASE="$_branch_resume_base"
+    _branch_resume_head="$(sed -n 's/^- head ref: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
+    if $BRANCH_HEAD_SET && [[ -n "$_branch_resume_head" && "$BRANCH_HEAD" != "$_branch_resume_head" ]]; then
+      die "Resume --branch-head '$BRANCH_HEAD' does not match persisted value '$_branch_resume_head'"
+    fi
+    [[ -n "$_branch_resume_head" ]] && BRANCH_HEAD="$_branch_resume_head"
     BRANCH_BASE_SHA="$(sed -n 's/^- base commit: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
     BRANCH_HEAD_SHA="$(sed -n 's/^- head commit: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
     BRANCH_MERGE_BASE="$(sed -n 's/^- merge base: //p' "$BRANCH_MANIFEST_FILE" | head -1)"
@@ -2671,7 +2676,7 @@ if [[ "$MODE" == "branch-review" ]]; then
       fi
       unset _branch_checked_out_sha
     fi
-    unset _branch_resume_base
+    unset _branch_resume_base _branch_resume_head
   else
     BRANCH_BASE_SHA="$(git -C "$PROJECT_PATH" rev-parse --verify --quiet "${BRANCH_BASE}^{commit}" 2>/dev/null)" \
       || die "Mode 'branch-review' could not resolve --branch-base '$BRANCH_BASE' to a commit in $PROJECT_PATH — check that it is a valid git ref (fetch it first if it only exists on the remote)."
